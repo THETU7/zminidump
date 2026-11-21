@@ -7,11 +7,11 @@ Zminidump 面向在外网开发机上排查原生程序崩溃的开发者。通�
 ## 用法
 
 ```sh
-# 离线 HTML 报告(默认仅路径与行号)
+# 离线 HTML 报告(默认嵌入关键帧附近的源码片段)
 zminidump analyze crash.dmp --html report.html --symbol-path ./symbols --no-debuginfod
 
-# 嵌入关键帧附近的源码片段;或 --include-source=full 嵌入完整源文件
-zminidump analyze crash.dmp --html report.html --include-source=context
+# 关闭源码嵌入仅留路径行号;或 --include-source=full 嵌入完整源文件
+zminidump analyze crash.dmp --html report.html --include-source=none
 
 # JSON 导出,用于回归对比或接入其他工具
 zminidump analyze crash.dmp --json report.json

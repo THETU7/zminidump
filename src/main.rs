@@ -32,8 +32,8 @@ enum Command {
         #[arg(long)]
         json: Option<PathBuf>,
 
-        /// 源码嵌入模式:none 仅路径行号(默认),context 关键帧附近片段,full 完整文件
-        #[arg(long = "include-source", value_enum, default_value = "none")]
+        /// 源码嵌入模式:none 仅路径行号,context 关键帧附近片段(默认),full 完整文件
+        #[arg(long = "include-source", value_enum, default_value = "context")]
         include_source: IncludeSource,
 
         /// context 模式下关键帧前后各嵌入的行数

@@ -15,10 +15,10 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceMode {
-    /// 仅显示路径和行号(默认)。
-    #[default]
+    /// 仅显示路径和行号。
     None,
-    /// 嵌入关键帧附近的源码片段。
+    /// 嵌入关键帧附近的源码片段(默认)。
+    #[default]
     Context,
     /// 嵌入调用栈引用的完整源文件。
     Full,

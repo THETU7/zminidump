@@ -42,7 +42,7 @@ impl Default for AnalyzeOptions {
             user_debug_file: None,
             debuginfod_urls: Vec::new(),
             cache_dir: default_cache_dir(),
-            source_mode: SourceMode::None,
+            source_mode: SourceMode::Context,
             context_lines: 3,
             max_source_bytes: 2 * 1024 * 1024,
             limits: Default::default(),
@@ -66,12 +66,14 @@ pub fn default_cache_dir() -> PathBuf {
 }
 
 /// 从 `DEBUGINFOD_URLS` 环境变量读取默认服务器列表。
+/// 按 elfutils 约定跳过 `ima:` 前缀的策略指令(如 `ima:enforcing`),
+/// 它们不是服务器 URL;当作 URL 请求会以协议错误失败并污染错误信息。
 pub fn debuginfod_urls_from_env() -> Vec<String> {
     std::env::var("DEBUGINFOD_URLS")
         .unwrap_or_default()
         .split_whitespace()
+        .filter(|s| !s.is_empty() && !s.starts_with("ima:"))
         .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
         .collect()
 }
 

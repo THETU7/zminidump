@@ -398,7 +398,7 @@ fn render_sources(html: &mut String, report: &Report) {
     if report.source_mode == SourceMode::None {
         let _ = writeln!(
             html,
-            "<p class=\"muted\">默认仅显示路径与行号。使用 <code>--include-source=context|full</code> 可在导出时嵌入源码片段。</p>"
+            "<p class=\"muted\">源码嵌入已关闭(<code>--include-source=none</code>)。使用 <code>--include-source=context|full</code> 可在导出时嵌入源码片段。</p>"
         );
         return;
     }

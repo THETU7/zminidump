@@ -3,7 +3,7 @@
 //! 端点遵循 <https://sourceware.org/elfutils/Debuginfod.html>:
 //! - `{base}/buildid/{id}/executable`
 //! - `{base}/buildid/{id}/debuginfo`
-//! - `{base}/source/{id}/{path}`(path 去掉开头的 `/`)
+//! - `{base}/buildid/{id}/source/{path}`(path 去掉开头的 `/`)
 //!
 //! 控制下载超时、单次下载大小;并发由调用方通过信号量控制。
 
@@ -99,7 +99,7 @@ impl DebuginfodClient {
     /// 获取源码文件。`path` 为 DWARF 记录的路径,去掉开头的 `/`。
     pub fn fetch_source(&self, server: &str, build_id: &str, path: &str) -> FetchResult {
         let trimmed = path.trim_start_matches('/');
-        self.fetch(&format!("{server}/source/{build_id}/{trimmed}"))
+        self.fetch(&format!("{server}/buildid/{build_id}/source/{trimmed}"))
     }
 
     pub fn timeout(&self) -> Duration {

@@ -1,7 +1,7 @@
 //! 源码嵌入:按导出选项查找调用栈引用的源码。
 //!
 //! 查找顺序:本地绝对路径(DWARF 记录路径,通常已按 `DW_AT_comp_dir`
-//! 拼接为绝对路径)→ 各 debuginfod 的 `/source/{buildid}/{path}`。
+//! 拼接为绝对路径)→ 各 debuginfod 的 `/buildid/{buildid}/source/{path}`。
 //! 同一源码文件只下载一次;`context` 模式合并重叠片段;总大小受上限
 //! 约束,超限时停止嵌入并记录省略。
 

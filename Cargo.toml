@@ -3,6 +3,7 @@ name = "zminidump"
 version = "0.1.0"
 edition = "2024"
 description = "Cross-platform viewer for Breakpad and Crashpad minidumps"
+license = "MIT"
 
 [dependencies]
 minidump = "0.27.0"

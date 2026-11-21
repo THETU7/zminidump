@@ -136,14 +136,26 @@ pub enum IdMatch {
 }
 
 /// 校验 ELF 元数据是否匹配模块身份。
+///
+/// dump 带完整 Code ID(Linux 上即完整 GNU Build ID)时只做完整比较:
+/// 前缀相同但末尾不同的 Build ID 属于不同构建,不得回退到 GUID 前缀
+/// 匹配;仅当 dump 缺少完整 ID(只带 Breakpad GUID)时才允许前缀回退。
 pub fn match_identity(meta: &ElfMeta, ident: &ModuleIdentity) -> Option<IdMatch> {
     let Some(elf_id) = &meta.build_id else {
         return None;
     };
-    if let Some(code) = ident.code_id.as_ref()
-        && elf_id.eq_ignore_ascii_case(code.as_str())
-    {
-        return Some(IdMatch::Full);
+    let has_full_code_id = ident
+        .code_id
+        .as_ref()
+        .map(|c| !c.as_str().is_empty())
+        .unwrap_or(false);
+    if has_full_code_id {
+        let code = ident.code_id.as_ref().expect("checked above");
+        return if elf_id.eq_ignore_ascii_case(code.as_str()) {
+            Some(IdMatch::Full)
+        } else {
+            None
+        };
     }
     if let Some(debug) = ident.debug_id
         && guid_matches(elf_id, &debug)
@@ -268,9 +280,12 @@ impl LocalIndex {
                     }
                 }
                 ArtifactKind::Executable => {
-                    if elf.meta.has_exec_segments {
-                        score += 2;
+                    // 独立调试文件没有可执行段,也没有 `.eh_frame`,
+                    // 不能充当可执行镜像(否则会错过远程镜像回退)。
+                    if !elf.meta.has_exec_segments {
+                        continue;
                     }
+                    score += 2;
                     if !looks_like_debug_file(&elf.path) {
                         score += 1;
                     }
@@ -294,13 +309,12 @@ impl LocalIndex {
     /// 按 Breakpad Debug ID 查找预生成 `.sym`。
     pub fn find_sym(&self, ident: &ModuleIdentity) -> Option<&LocalSym> {
         let debug = ident.debug_id?;
-        // .sym 的 MODULE 行使用 Breakpad 格式(大写 GUID-AGE)。
-        let wanted = format!("{debug}");
-        let wanted_upper = wanted.to_uppercase();
-        self.syms.iter().find(|s| {
-            s.debug_id.eq_ignore_ascii_case(&wanted)
-                || s.debug_id.eq_ignore_ascii_case(&wanted_upper)
-        })
+        // .sym 的 MODULE 行使用 Breakpad 格式:无连字符的大写 GUID + Age,
+        // 而非 DebugId 的普通显示格式(带连字符 UUID)。
+        let wanted = debug.breakpad().to_string();
+        self.syms
+            .iter()
+            .find(|s| s.debug_id.eq_ignore_ascii_case(&wanted))
     }
 }
 
@@ -479,19 +493,35 @@ impl ArtifactResolver {
         kind: ArtifactKind,
         ident: &ModuleIdentity,
     ) -> Result<ResolvedArtifact, ArtifactStatus> {
-        // 本地(用户指定 + 扫描)与缓存。
-        match self.local_and_cache(kind, ident) {
+        // 本地(用户指定 + 扫描)与缓存。身份不匹配只否定对应的单个候选
+        // (例如用户指定的主程序对 `.so` 模块必然不匹配),不得据此阻断
+        // 对同一模块的其他来源(缓存、debuginfod)的查找。
+        let local_mismatch = match self.local_and_cache(kind, ident) {
             Ok(a) => return Ok(a),
             Err(status) => {
-                // IdentityMismatch 具有诊断价值,直接返回;
-                // 其余情况继续尝试网络。
                 if matches!(status, ArtifactStatus::IdentityMismatch { .. }) {
-                    return Err(status);
+                    Some(status)
+                } else {
+                    None
                 }
             }
-        }
+        };
 
-        self.fetch_remote(kind, ident).await
+        match self.fetch_remote(kind, ident).await {
+            Ok(a) => Ok(a),
+            // 网络也未取得时,保留本地身份不匹配的诊断价值。
+            Err(remote) => match local_mismatch {
+                Some(m)
+                    if matches!(
+                        remote,
+                        ArtifactStatus::NoSource | ArtifactStatus::NotArchived { .. }
+                    ) =>
+                {
+                    Err(m)
+                }
+                _ => Err(remote),
+            },
+        }
     }
 
     fn local_and_cache(
@@ -842,9 +872,20 @@ mod tests {
             has_debug_info: true,
             has_exec_segments: true,
         };
+        // 1. 完整 ID 相等 → Full。
         let full = ident(Some("aabbccddeeff00112233445566778899aabb"), None);
         assert_eq!(match_identity(&meta, &full), Some(IdMatch::Full));
 
+        // 2. dump 带完整 ID 但前 16 字节相同、末尾不同 → 拒绝,
+        //    不得回退到 GUID 前缀匹配(那是另一个构建)。
+        let prefix_same_tail_diff = ident(Some("aabbccddeeff00112233445566778899ffff"), None);
+        assert_eq!(
+            match_identity(&meta, &prefix_same_tail_diff),
+            None,
+            "完整 ID 尾部不同必须拒绝"
+        );
+
+        // 3. dump 只带旧标识(Breakpad GUID,无完整 ID)→ 前缀回退。
         let bytes = hex_to_bytes("aabbccddeeff00112233445566778899aabb").unwrap();
         let debug = debugid::DebugId::from_guid_age(&bytes[..16], 0).unwrap();
         let truncated = ModuleIdentity {
@@ -874,6 +915,45 @@ mod tests {
         let probed = probe_sym_file(&sym).unwrap();
         assert_eq!(probed.name, "libtest.so");
         assert_eq!(probed.debug_id.len(), 33); // 32 hex + age
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_sym_matches_breakpad_module_id() {
+        // MODULE 行使用 Breakpad 格式(无连字符大写 GUID + Age);
+        // 用普通 DebugId 显示格式(带连字符 UUID)查找不得命中。
+        let dir = std::env::temp_dir().join(format!("zmsym-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = hex_to_bytes("4f2a1b0c3d4e5f60718293a4b5c6d7e8").unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes, 0).unwrap();
+        fs::write(
+            dir.join("libtest.sym"),
+            format!("MODULE Linux x86_64 {} libtest.so\n", debug.breakpad()),
+        )
+        .unwrap();
+        let index = LocalIndex::scan(std::slice::from_ref(&dir));
+
+        let mut ident = ident(None, None);
+        ident.debug_id = Some(debug);
+        let found = index.find_sym(&ident).expect("应按 Breakpad 格式命中 .sym");
+        assert_eq!(found.name, "libtest.so");
+
+        // 大小写不敏感:小写的 MODULE ID 同样命中。
+        fs::write(
+            dir.join("lower.sym"),
+            format!(
+                "MODULE Linux x86_64 {} libtest.so\n",
+                debug.breakpad().to_string().to_lowercase()
+            ),
+        )
+        .unwrap();
+        let index = LocalIndex::scan(std::slice::from_ref(&dir));
+        assert!(index.find_sym(&ident).is_some());
+
+        // 不同 GUID 不命中。
+        let other_bytes = hex_to_bytes("00112233445566778899aabbccddeeff").unwrap();
+        ident.debug_id = Some(debugid::DebugId::from_guid_age(&other_bytes, 0).unwrap());
+        assert!(index.find_sym(&ident).is_none());
         fs::remove_dir_all(&dir).ok();
     }
 }

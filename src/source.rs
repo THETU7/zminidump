@@ -1,9 +1,12 @@
 //! 源码嵌入:按导出选项查找调用栈引用的源码。
 //!
-//! 查找顺序:本地绝对路径(DWARF 记录路径,通常已按 `DW_AT_comp_dir`
-//! 拼接为绝对路径)→ 各 debuginfod 的 `/buildid/{buildid}/source/{path}`。
-//! 同一源码文件只下载一次;`context` 模式合并重叠片段;总大小受上限
-//! 约束,超限时停止嵌入并记录省略。
+//! 优先使用按 Build ID 查到的归档源码(各 debuginfod 的
+//! `/buildid/{buildid}/source/{path}` 及其缓存),保证内容与报告中的
+//! 构建一致。本机路径仅在用户显式配置源码根目录(`--source-root`)时
+//! 读取,且解析后的路径必须仍位于某个根目录内。同一源码路径可能来自
+//! 不同构建,报告全程以 (Build ID, 路径) 为键区分。同一文件只下载
+//! 一次;`context` 模式合并重叠片段;总大小受上限约束,超限时停止
+//! 嵌入并记录省略。
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -19,6 +22,8 @@ pub struct SourceCollector {
     mode: SourceMode,
     context_lines: u32,
     max_bytes: u64,
+    /// 用户显式授权的本地源码根目录;为空时不读取任何本机文件。
+    source_roots: Vec<PathBuf>,
 }
 
 /// 一个被引用的源码文件的聚合信息。
@@ -36,12 +41,14 @@ impl SourceCollector {
         mode: SourceMode,
         context_lines: u32,
         max_bytes: u64,
+        source_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
             resolver,
             mode,
             context_lines,
             max_bytes,
+            source_roots,
         }
     }
 
@@ -74,11 +81,13 @@ impl SourceCollector {
             return;
         }
 
-        // 聚合同一文件的引用。
+        // 聚合引用;同一路径可能由不同构建引用,以 (路径, Build ID) 为键,
+        // 不同构建的同名源码文件分别嵌入。
         let mut files: Vec<(String, FileRef)> = Vec::new();
-        let mut index_of: HashMap<String, usize> = HashMap::new();
+        let mut index_of: HashMap<(String, Option<String>), usize> = HashMap::new();
         for (path, build_id, lines) in references {
-            let idx = match index_of.get(&path) {
+            let key = (path.clone(), build_id.clone());
+            let idx = match index_of.get(&key) {
                 Some(i) => *i,
                 None => {
                     files.push((
@@ -88,7 +97,7 @@ impl SourceCollector {
                             build_id,
                         },
                     ));
-                    index_of.insert(path, files.len() - 1);
+                    index_of.insert(key, files.len() - 1);
                     files.len() - 1
                 }
             };
@@ -174,79 +183,98 @@ impl SourceCollector {
         report.source_omitted_count = omitted;
     }
 
-    /// 获取源码内容:本地路径 → 源码缓存 → debuginfod。
+    /// 获取源码内容:按 Build ID 的归档缓存 → debuginfod `/source` →
+    /// 用户显式授权的本地源码根目录。默认(未配置根目录)绝不读取
+    /// 本机文件,避免把与报告构建无关的内容嵌入报告。
     async fn fetch_file(&self, path: &str, build_id: Option<&str>) -> Result<String, SourceStatus> {
-        // 1. 本地绝对路径直接可用(开发机常见)。
-        let local = PathBuf::from(path);
-        if local.is_file() {
-            if let Ok(text) = std::fs::read_to_string(&local) {
-                return Ok(text);
-            }
-            // 以丢失容错方式读取非 UTF-8 源文件。
-            if let Ok(bytes) = std::fs::read(&local) {
-                return Ok(String::from_utf8_lossy(&bytes).into_owned());
-            }
-        }
+        let mut not_archived = false;
 
-        let Some(build_id) = build_id else {
-            return Err(SourceStatus::NotFound);
-        };
-        let cfg = self.resolver.config();
+        // 1. 按 Build ID 查找:各服务器缓存 → debuginfod /source。
+        if let Some(build_id) = build_id {
+            let cfg = self.resolver.config();
 
-        // 2. 各服务器缓存。
-        for server in &cfg.debuginfod_urls {
-            let cache = self.resolver.source_cache_path(server, build_id, path);
-            if let Ok(text) = std::fs::read_to_string(&cache) {
-                return Ok(text);
-            }
-        }
-
-        // 3. debuginfod /source。
-        if cfg.debuginfod_urls.is_empty() {
-            return Err(SourceStatus::NotFound);
-        }
-        let mut last_not_archived = false;
-        for server in &cfg.debuginfod_urls {
-            let permit = self
-                .resolver
-                .semaphore()
-                .clone()
-                .acquire_owned()
-                .await
-                .unwrap();
-            let client = self.resolver.client().clone();
-            let url = server.clone();
-            let bid = build_id.to_string();
-            let p = path.to_string();
-            let result =
-                tokio::task::spawn_blocking(move || client.fetch_source(&url, &bid, &p)).await;
-            drop(permit);
-            match result {
-                Ok(FetchResult::Ok(bytes)) => {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    let cache = self.resolver.source_cache_path(server, build_id, path);
-                    crate::artifacts::write_atomic(&cache, text.as_bytes()).ok();
+            for server in &cfg.debuginfod_urls {
+                let cache = self.resolver.source_cache_path(server, build_id, path);
+                if let Ok(text) = std::fs::read_to_string(&cache) {
                     return Ok(text);
                 }
-                Ok(FetchResult::NotFound) => {
-                    last_not_archived = true;
-                    continue;
-                }
-                Ok(FetchResult::Failed(message)) => {
-                    return Err(SourceStatus::FetchFailed { message });
-                }
-                Err(e) => {
-                    return Err(SourceStatus::FetchFailed {
-                        message: format!("下载任务失败:{e}"),
-                    });
+            }
+
+            for server in &cfg.debuginfod_urls {
+                let permit = self
+                    .resolver
+                    .semaphore()
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .unwrap();
+                let client = self.resolver.client().clone();
+                let url = server.clone();
+                let bid = build_id.to_string();
+                let p = path.to_string();
+                let result =
+                    tokio::task::spawn_blocking(move || client.fetch_source(&url, &bid, &p)).await;
+                drop(permit);
+                match result {
+                    Ok(FetchResult::Ok(bytes)) => {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let cache = self.resolver.source_cache_path(server, build_id, path);
+                        crate::artifacts::write_atomic(&cache, text.as_bytes()).ok();
+                        return Ok(text);
+                    }
+                    Ok(FetchResult::NotFound) => {
+                        not_archived = true;
+                        continue;
+                    }
+                    Ok(FetchResult::Failed(message)) => {
+                        return Err(SourceStatus::FetchFailed { message });
+                    }
+                    Err(e) => {
+                        return Err(SourceStatus::FetchFailed {
+                            message: format!("下载任务失败:{e}"),
+                        });
+                    }
                 }
             }
         }
-        if last_not_archived {
-            Err(SourceStatus::NotArchived)
-        } else {
-            Err(SourceStatus::NotFound)
+
+        // 2. 用户显式授权的本地源码根目录;解析后的路径必须仍位于根内。
+        //    归档中未找到时,本地获准的源码仍可离线嵌入。
+        if let Some(text) = self.read_local_authorized(path) {
+            return Ok(text);
         }
+
+        Err(if not_archived {
+            SourceStatus::NotArchived
+        } else {
+            SourceStatus::NotFound
+        })
+    }
+
+    /// 读取本机源码文件;仅当用户显式配置了源码根目录,且路径规范化后
+    /// 仍位于某个根目录之内时允许。符号链接逃逸会被两侧的 canonicalize
+    /// 规整后排除。
+    fn read_local_authorized(&self, path: &str) -> Option<String> {
+        if self.source_roots.is_empty() {
+            return None;
+        }
+        let local = PathBuf::from(path);
+        let canonical = local.canonicalize().ok()?;
+        for root in &self.source_roots {
+            let Ok(root_canonical) = root.canonicalize() else {
+                continue;
+            };
+            if canonical.starts_with(&root_canonical) {
+                if let Ok(text) = std::fs::read_to_string(&canonical) {
+                    return Some(text);
+                }
+                // 以丢失容错方式读取非 UTF-8 源文件。
+                if let Ok(bytes) = std::fs::read(&canonical) {
+                    return Some(String::from_utf8_lossy(&bytes).into_owned());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -296,39 +324,33 @@ fn _keep(v: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifacts::{ArtifactResolver, ResolverConfig};
-    use crate::report::{Report, SourceStatus};
+    use crate::report::SourceStatus;
+    use std::path::Path;
 
-    fn collector(mode: SourceMode, max_bytes: u64) -> (SourceCollector, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("zmsrc-{}-{}", std::process::id(), mode.as_str()));
+    fn make_collector(
+        tag: &str,
+        mode: SourceMode,
+        max_bytes: u64,
+        source_roots: Vec<PathBuf>,
+    ) -> (SourceCollector, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zmsrc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let resolver = std::sync::Arc::new(ArtifactResolver::new(ResolverConfig {
+        let resolver = Arc::new(ArtifactResolver::new(ResolverConfig {
             cache_dir: dir.join("cache"),
             ..Default::default()
         }));
-        (SourceCollector::new(resolver, mode, 1, max_bytes), dir)
+        (
+            SourceCollector::new(resolver, mode, 1, max_bytes, source_roots),
+            dir,
+        )
     }
 
-    async fn embed(mode: SourceMode, max_bytes: u64) -> (Report, std::path::PathBuf) {
-        let (collector, dir) = collector(mode, max_bytes);
-        let file_a = dir.join("a.c");
-        let file_b = dir.join("b.c");
-        std::fs::write(
-            &file_a,
-            (1..=50)
-                .map(|i| format!("line-{i:02}\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
-        std::fs::write(
-            &file_b,
-            (1..=50).map(|i| format!("B-{i:02}\n")).collect::<String>(),
-        )
-        .unwrap();
-        let mut report = Report {
+    fn empty_report(mode: SourceMode, max_bytes: u64) -> Report {
+        Report {
             schema_version: 1,
             tool_name: "t".into(),
             tool_version: "0".into(),
@@ -349,22 +371,60 @@ mod tests {
             source_mode: mode,
             source_omitted_count: 0,
             source_max_bytes: max_bytes,
-        };
-        let refs = vec![
-            (
-                file_a.to_string_lossy().into_owned(),
-                None,
-                vec![10u32, 11, 30],
-            ),
-            (file_b.to_string_lossy().into_owned(), None, vec![5]),
-        ];
-        collector.embed(&mut report, refs).await;
-        (report, dir)
+        }
+    }
+
+    fn write_fixture_sources(dir: &Path) {
+        std::fs::write(
+            dir.join("a.c"),
+            (1..=50)
+                .map(|i| format!("line-{i:02}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.c"),
+            (1..=50).map(|i| format!("B-{i:02}\n")).collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    /// 本地读取需要显式授权的常规嵌入用例:固件目录同时配置为源码根目录。
+    fn authorized_collector(mode: SourceMode, max_bytes: u64) -> (SourceCollector, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "zmsrc-embed-{}-{}",
+            std::process::id(),
+            mode.as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_fixture_sources(&dir);
+        let resolver = Arc::new(ArtifactResolver::new(ResolverConfig {
+            cache_dir: dir.join("cache"),
+            ..Default::default()
+        }));
+        (
+            SourceCollector::new(resolver, mode, 1, max_bytes, vec![dir.clone()]),
+            dir,
+        )
     }
 
     #[tokio::test]
     async fn context_mode_merges_and_caps() {
-        let (report, dir) = embed(SourceMode::Context, 60).await;
+        let (collector, dir) = authorized_collector(SourceMode::Context, 60);
+        let mut report = empty_report(SourceMode::Context, 60);
+        let refs = vec![
+            (
+                dir.join("a.c").to_string_lossy().into_owned(),
+                None,
+                vec![10u32, 11, 30],
+            ),
+            (
+                dir.join("b.c").to_string_lossy().into_owned(),
+                None,
+                vec![5],
+            ),
+        ];
+        collector.embed(&mut report, refs).await;
         // a.c 两段片段 56 字节嵌入后,剩余预算 4 字节 < b.c 的 15 字节 → b.c 被省略。
         let statuses: Vec<&SourceStatus> = report.sources.iter().map(|s| &s.status).collect();
         assert!(
@@ -387,7 +447,14 @@ mod tests {
 
     #[tokio::test]
     async fn full_mode_embeds_whole_file() {
-        let (report, dir) = embed(SourceMode::Full, 10_000).await;
+        let (collector, dir) = authorized_collector(SourceMode::Full, 10_000);
+        let mut report = empty_report(SourceMode::Full, 10_000);
+        let refs = vec![(
+            dir.join("a.c").to_string_lossy().into_owned(),
+            None,
+            vec![10u32, 11, 30],
+        )];
+        collector.embed(&mut report, refs).await;
         let src = &report.sources[0];
         assert!(matches!(src.status, SourceStatus::Embedded { .. }));
         assert_eq!(src.lines.as_ref().unwrap().len(), 50);
@@ -397,7 +464,14 @@ mod tests {
 
     #[tokio::test]
     async fn none_mode_records_disabled_only() {
-        let (report, dir) = embed(SourceMode::None, 10_000).await;
+        let (collector, dir) = authorized_collector(SourceMode::None, 10_000);
+        let mut report = empty_report(SourceMode::None, 10_000);
+        let refs = vec![(
+            dir.join("a.c").to_string_lossy().into_owned(),
+            None,
+            vec![5u32],
+        )];
+        collector.embed(&mut report, refs).await;
         assert!(
             report
                 .sources
@@ -405,6 +479,144 @@ mod tests {
                 .all(|s| matches!(s.status, SourceStatus::Disabled))
         );
         assert!(report.sources.iter().all(|s| s.lines.is_none()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// P1-4:默认(未配置源码根目录)不得读取本机文件,即使路径真实存在;
+    /// 配置包含该文件的根目录后才允许离线嵌入;根目录之外的路径仍被拒绝。
+    #[tokio::test]
+    async fn local_read_requires_authorized_source_root() {
+        let file_dir = std::env::temp_dir().join(format!(
+            "zmsrc-auth-file-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let src = file_dir.join("secret.c");
+        std::fs::write(&src, "int leak(void) { return 1; }\n").unwrap();
+        let path = src.to_string_lossy().into_owned();
+
+        // 1. 默认:未配置源码根目录 → 即使本机存在该文件也不嵌入。
+        let (collector, dir) = make_collector("auth-def", SourceMode::Full, 10_000, Vec::new());
+        let mut report = empty_report(SourceMode::Full, 10_000);
+        collector
+            .embed(&mut report, vec![(path.clone(), None, vec![1u32])])
+            .await;
+        assert_eq!(report.sources.len(), 1);
+        assert!(
+            matches!(report.sources[0].status, SourceStatus::NotFound),
+            "默认不得读取本机文件:{:?}",
+            report.sources[0].status
+        );
+        assert!(report.sources[0].lines.is_none());
+        std::fs::remove_dir_all(dir).ok();
+
+        // 2. 显式授权包含该文件的根目录 → 嵌入。
+        let (collector, dir) = make_collector(
+            "auth-ok",
+            SourceMode::Full,
+            10_000,
+            vec![file_dir.clone()],
+        );
+        let mut report = empty_report(SourceMode::Full, 10_000);
+        collector
+            .embed(&mut report, vec![(path.clone(), None, vec![1u32])])
+            .await;
+        assert!(matches!(report.sources[0].status, SourceStatus::Embedded { .. }));
+        assert!(
+            report.sources[0]
+                .lines
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("int leak")),
+            "获准的本地源码应可离线嵌入"
+        );
+        std::fs::remove_dir_all(dir).ok();
+
+        // 3. 授权的根目录不包含该路径(位于根外)→ 拒绝。
+        let other_root = std::env::temp_dir().join(format!(
+            "zmsrc-auth-other-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        let (collector, dir) = make_collector(
+            "auth-out",
+            SourceMode::Full,
+            10_000,
+            vec![other_root.clone()],
+        );
+        let mut report = empty_report(SourceMode::Full, 10_000);
+        collector
+            .embed(&mut report, vec![(path, None, vec![1u32])])
+            .await;
+        assert!(
+            !matches!(report.sources[0].status, SourceStatus::Embedded { .. }),
+            "根目录外的路径不得嵌入:{:?}",
+            report.sources[0].status
+        );
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(other_root).ok();
+        std::fs::remove_dir_all(file_dir).ok();
+    }
+
+    /// P2-7:同一路径由两个不同构建引用时分别嵌入,内容互不覆盖。
+    /// 两个构建的源码通过按 Build ID 组织的源码缓存提供。
+    #[tokio::test]
+    async fn same_path_different_builds_embed_separately() {
+        let dir = std::env::temp_dir().join(format!("zmsrc-twobuild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = "/src/shared/version.c";
+
+        // 为两个 Build ID 预置内容不同的源码缓存。
+        let server = "http://127.0.0.1:9";
+        let resolver = Arc::new(ArtifactResolver::new(ResolverConfig {
+            cache_dir: dir.join("cache"),
+            debuginfod_urls: vec![server.to_string()],
+            ..Default::default()
+        }));
+        let bid_a = "aa112233445566778899aabbccddeeff0011";
+        let bid_b = "bb112233445566778899aabbccddeeff0022";
+        let cache_a = resolver.source_cache_path(server, bid_a, path);
+        let cache_b = resolver.source_cache_path(server, bid_b, path);
+        for (cache, content) in [
+            (&cache_a, "int version(void) { return 1; } // build A\n"),
+            (&cache_b, "int version(void) { return 2; } // build B\n"),
+        ] {
+            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            std::fs::write(cache, content).unwrap();
+        }
+
+        let collector = SourceCollector::new(resolver, SourceMode::Full, 1, 10_000, Vec::new());
+        let mut report = empty_report(SourceMode::Full, 10_000);
+        collector
+            .embed(
+                &mut report,
+                vec![
+                    (path.to_string(), Some(bid_a.to_string()), vec![1u32]),
+                    (path.to_string(), Some(bid_b.to_string()), vec![1u32]),
+                ],
+            )
+            .await;
+
+        assert_eq!(report.sources.len(), 2, "两个构建应分别嵌入");
+        let a = &report.sources[0];
+        let b = &report.sources[1];
+        assert_eq!(a.build_id.as_deref(), Some(bid_a));
+        assert_eq!(b.build_id.as_deref(), Some(bid_b));
+        assert_eq!(a.path, path);
+        assert_eq!(b.path, path);
+        assert!(matches!(a.status, SourceStatus::Embedded { .. }));
+        assert!(matches!(b.status, SourceStatus::Embedded { .. }));
+        assert!(
+            a.lines.as_ref().unwrap()[0].contains("return 1"),
+            "构建 A 的帧应看到版本 1:{}",
+            a.lines.as_ref().unwrap()[0]
+        );
+        assert!(
+            b.lines.as_ref().unwrap()[0].contains("return 2"),
+            "构建 B 的帧应看到版本 2:{}",
+            b.lines.as_ref().unwrap()[0]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

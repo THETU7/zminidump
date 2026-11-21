@@ -44,6 +44,10 @@ enum Command {
         #[arg(long = "symbol-path")]
         symbol_paths: Vec<PathBuf>,
 
+        /// 允许读取源码的本地根目录,可重复;默认不读取本机源码文件
+        #[arg(long = "source-root")]
+        source_roots: Vec<PathBuf>,
+
         /// 主程序路径(辅助匹配;仍按 Build ID 核验)
         #[arg(long)]
         binary: Option<PathBuf>,
@@ -109,6 +113,7 @@ fn main() -> ExitCode {
             include_source,
             context_lines,
             symbol_paths,
+            source_roots,
             binary,
             debug_file,
             debuginfod,
@@ -136,6 +141,7 @@ fn main() -> ExitCode {
                 debuginfod_urls,
                 cache_dir: cache.unwrap_or_else(zminidump::analyze::default_cache_dir),
                 source_mode: include_source.into(),
+                source_roots,
                 context_lines,
                 max_source_bytes,
                 limits: zminidump::artifacts::Limits {
@@ -161,6 +167,72 @@ fn main() -> ExitCode {
     }
 }
 
+/// 规范化路径用于比较:优先 canonicalize(解析符号链接与 `..`);
+/// 文件不存在(通常是待写入的输出)时规范化已存在的父目录再拼接文件名。
+fn resolve_for_compare(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let parent = p.parent()?;
+    let leaf = p.file_name()?;
+    let parent = parent.canonicalize().ok()?;
+    Some(parent.join(leaf))
+}
+
+/// 绝对化并词法归一(`.` / `..`)后的路径;两侧都无法访问文件系统时的
+/// 最终比较依据。
+fn lexical_absolute(p: &std::path::Path) -> std::path::PathBuf {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = std::path::PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 判断两个路径是否指向同一文件;覆盖相对路径、`..`、符号链接与硬链接
+/// 别名等情形,防止报告输出覆盖输入 dump 或先前的报告。
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (resolve_for_compare(a), resolve_for_compare(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => lexical_absolute(a) == lexical_absolute(b),
+    }
+}
+
+/// 拒绝会覆盖输入 dump 或互相覆盖的输出组合。
+fn check_output_conflicts(
+    dump: &std::path::Path,
+    html: Option<&std::path::Path>,
+    json: Option<&std::path::Path>,
+) -> Result<(), String> {
+    for (label, out) in [("HTML", html), ("JSON", json)] {
+        if let Some(out) = out
+            && same_file(out, dump)
+        {
+            return Err(format!(
+                "{label} 输出 {} 与输入 dump 指向同一文件,拒绝覆盖",
+                out.display()
+            ));
+        }
+    }
+    if let (Some(h), Some(j)) = (html, json)
+        && same_file(h, j)
+    {
+        return Err(format!(
+            "HTML 输出 {} 与 JSON 输出 {} 指向同一文件,拒绝互相覆盖",
+            h.display(),
+            j.display()
+        ));
+    }
+    Ok(())
+}
+
 async fn run_analyze(
     dump: &std::path::Path,
     opts: &AnalyzeOptions,
@@ -170,6 +242,7 @@ async fn run_analyze(
     if html.is_none() && json.is_none() {
         return Err("请至少指定 --html 或 --json 之一".into());
     }
+    check_output_conflicts(dump, html, json)?;
     let report = analyze_dump(dump, opts).await.map_err(|e| e.to_string())?;
 
     if let Some(path) = json {
@@ -212,4 +285,47 @@ async fn run_analyze(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn same_file_detects_aliases_and_lexical_duplicates() {
+        let dir = std::env::temp_dir().join(format!("zmsame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dump = dir.join("crash.dmp");
+        std::fs::write(&dump, b"dmp").unwrap();
+
+        // 同一路径与相对 `..` 别名。
+        assert!(same_file(&dump, &dump));
+        assert!(same_file(
+            &PathBuf::from(format!("{}/sub/../crash.dmp", dir.display())),
+            &dump
+        ));
+
+        // 不同文件不算同一目标。
+        let other = dir.join("other.dmp");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(!same_file(&other, &dump));
+
+        // 符号链接别名。
+        #[cfg(unix)]
+        {
+            let alias = dir.join("alias.dmp");
+            std::os::unix::fs::symlink(&dump, &alias).unwrap();
+            assert!(same_file(&alias, &dump));
+        }
+
+        // 输出文件尚不存在:退化为词法比较,`..` 与相对路径仍可识别。
+        assert!(same_file(
+            Path::new("a/../b.html"),
+            Path::new("b.html")
+        ));
+        assert!(!same_file(Path::new("b.html"), Path::new("c.html")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

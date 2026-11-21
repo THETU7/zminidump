@@ -32,15 +32,20 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      # 每个目标打成一个带平台与架构名的压缩包;否则 Linux 与 macOS
+      # 会向同一 Release 上传同名 `zminidump` 资产互相覆盖。
       - name: Package
         shell: bash
         run: |
-          mkdir -p dist
+          name="${{ matrix.artifact }}"
+          mkdir -p stage dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/${{ matrix.target }}/release/zminidump.exe dist/
+            cp "target/${{ matrix.target }}/release/zminidump.exe" stage/
+            tar -a -cf "dist/${name}.zip" -C stage zminidump.exe
           else
-            cp target/${{ matrix.target }}/release/zminidump dist/
-            cp README.md dist/
+            cp "target/${{ matrix.target }}/release/zminidump" stage/
+            cp README.md stage/
+            tar -czf "dist/${name}.tar.gz" -C stage zminidump README.md
           fi
       - uses: actions/upload-artifact@v4
         with:

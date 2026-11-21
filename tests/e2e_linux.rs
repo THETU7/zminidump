@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use zminidump::report::{ArtifactStatus, SourceMode, SymbolStatus};
+use zminidump::report::{ArtifactOrigin, ArtifactStatus, SourceMode, SourceStatus, SymbolStatus};
 use zminidump::{AnalyzeOptions, Report, analyze_dump};
 
 // ---------------------------------------------------------------------------
@@ -298,7 +298,15 @@ fn real_crash_unwinds_to_source_lines_with_cfi() {
     produce_minidump(&dir.join("crasher"), &dump);
     assert!(dump.metadata().unwrap().len() > 0);
 
-    let report = run_analyze(&dump, &base_options(vec![dir.clone()], &dir.join("cache")));
+    let report = run_analyze(
+        &dump,
+        &{
+            let mut opts = base_options(vec![dir.clone()], &dir.join("cache"));
+            // P1-4:本地源码嵌入需要显式授权固件目录为源码根目录。
+            opts.source_roots = vec![dir.clone()];
+            opts
+        },
+    );
 
     // 异常与崩溃线程。
     let exception = report.exception.as_ref().expect("应有异常记录");
@@ -494,18 +502,47 @@ struct FakeDebuginfod {
     url: String,
 }
 
-/// kind(debuginfo/executable)→ build_id → 文件。
-type ServedFiles = std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>;
+/// 服务端归档内容。
+#[derive(Default)]
+struct Served {
+    /// kind(debuginfo/executable)→ build_id → 文件。
+    files: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
+    /// build_id → 源码相对路径(去掉开头 `/`)→ 文件。
+    sources: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
+}
+
+/// 请求路径里的百分号编码解码(服务端视角)。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 impl FakeDebuginfod {
-    fn start(files: Arc<ServedFiles>) -> Self {
+    fn start(served: Arc<Served>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let hit_counter = hits.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let files = files.clone();
+                let files = served.clone();
                 let hits = hit_counter.clone();
                 std::thread::spawn(move || handle(stream, files, hits));
             }
@@ -523,7 +560,7 @@ impl FakeDebuginfod {
 
 fn handle(
     mut stream: std::net::TcpStream,
-    files: Arc<ServedFiles>,
+    served: Arc<Served>,
     hits: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 ) {
     let mut buf = [0u8; 4096];
@@ -535,24 +572,46 @@ fn handle(
     let mut parts = line.split_whitespace();
     let _method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
-    // /buildid/{id}/{kind}
+    // /buildid/{id}/{kind} 或 /buildid/{id}/source/{path...}
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if segments.len() == 3 && segments[0] == "buildid" {
+    let hit: Option<Vec<u8>> = if segments.len() == 3 && segments[0] == "buildid" {
         let (id, kind) = (segments[1], segments[2]);
-        let hit = files
+        served
+            .files
             .get(kind)
             .and_then(|m| m.get(id))
-            .and_then(|f| fs::read(f).ok());
-        if let Some(bytes) = hit {
-            *hits.lock().unwrap().entry(kind.to_string()).or_insert(0) += 1;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                bytes.len()
-            );
-            stream.write_all(head.as_bytes()).unwrap();
-            stream.write_all(&bytes).unwrap();
-            return;
-        }
+            .and_then(|f| fs::read(f).ok())
+    } else if segments.len() >= 4 && segments[0] == "buildid" && segments[2] == "source" {
+        let id = segments[1];
+        let decoded = percent_decode(&segments[3..].join("/"));
+        served
+            .sources
+            .get(id)
+            .and_then(|m| m.get(&decoded))
+            .and_then(|f| fs::read(f).ok())
+    } else {
+        None
+    };
+    let counter_key = if segments.len() >= 4 && segments[2] == "source" {
+        "source"
+    } else if segments.len() == 3 {
+        segments[2]
+    } else {
+        ""
+    };
+    if let Some(bytes) = hit {
+        *hits
+            .lock()
+            .unwrap()
+            .entry(counter_key.to_string())
+            .or_insert(0) += 1;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&bytes).unwrap();
+        return;
     }
     stream
         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -577,16 +636,16 @@ fn debuginfod_download_and_cache_reuse() {
     produce_minidump(&dir.join("crasher"), &dump);
 
     // 服务端按 Build ID 归档:独立调试文件与剥离后的可执行文件。
-    let mut files: ServedFiles = std::collections::HashMap::new();
+    let mut served = Served::default();
     for (kind, suffix) in [("debuginfo", ".debug"), ("executable", "")] {
         let mut per_kind = std::collections::HashMap::new();
         for name in ["crasher", "libcrash.so"] {
             let path = dir.join(format!("{name}{suffix}"));
             per_kind.insert(elf_build_id(&path), path);
         }
-        files.insert(kind.to_string(), per_kind);
+        served.files.insert(kind.to_string(), per_kind);
     }
-    let server = FakeDebuginfod::start(Arc::new(files));
+    let server = FakeDebuginfod::start(Arc::new(served));
 
     let cache = dir.join("cache");
     let opts = AnalyzeOptions {
@@ -643,6 +702,361 @@ fn debuginfod_download_and_cache_reuse() {
 }
 
 // ---------------------------------------------------------------------------
+// 预生成 .sym 与混合来源(P1 回归)
+// ---------------------------------------------------------------------------
+
+/// 用 dump_syms 生成标准 Breakpad `.sym`(独立调试文件 + 剥离镜像合并)。
+fn generate_standard_sym(dir: &Path) -> Vec<u8> {
+    use dump_syms::{object_info::ObjectInfo, platform::Platform};
+    let debug = fs::read(dir.join("libcrash.so.debug")).unwrap();
+    let exe = fs::read(dir.join("libcrash.so")).unwrap();
+    let d = ObjectInfo::from_elf(&debug, "libcrash.so", Platform::Linux, None, true).unwrap();
+    let e = ObjectInfo::from_elf(&exe, "libcrash.so", Platform::Linux, None, true).unwrap();
+    let merged = ObjectInfo::merge(d, e).unwrap();
+    let mut text = Vec::new();
+    merged.dump(&mut text).unwrap();
+    text
+}
+
+/// P1-1:标准 Breakpad `.sym`(MODULE 行使用 Breakpad 格式标识)应能命中,
+/// 并用该文件提供的 CFI 展开到预期调用帧;仅提供 .sym 与 dump 即可。
+#[test]
+fn pregenerated_sym_unwinds_with_cfi() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过 .sym 测试");
+        return;
+    }
+    let dir = fixture_dir("sym");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    let text = generate_standard_sym(&dir);
+    let first_line = String::from_utf8_lossy(&text)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        first_line.starts_with("MODULE "),
+        "标准 .sym 应有 MODULE 行:{first_line}"
+    );
+    let sym_dir = dir.join("syms");
+    fs::create_dir_all(&sym_dir).unwrap();
+    fs::write(sym_dir.join("libcrash.so.sym"), &text).unwrap();
+
+    // 符号目录只提供 .sym(不含 ELF)。
+    let report = run_analyze(&dump, &base_options(vec![sym_dir], &dir.join("cache")));
+
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .expect("应有 libcrash.so 模块");
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            detail,
+            has_cfi,
+            has_lines,
+            ..
+        } => {
+            assert!(detail.contains("预生成"), "应命中预生成 .sym:{detail}");
+            assert!(has_cfi, ".sym 应含 CFI 展开规则");
+            assert!(has_lines, ".sym 应含行号");
+        }
+        other => panic!("libcrash 符号状态异常:{other:?}"),
+    }
+    let thread = &report.threads[report.crashing_thread.unwrap()];
+    assert!(
+        thread.frames[0]
+            .function
+            .as_deref()
+            .unwrap_or("")
+            .contains("inner"),
+        "{:?}",
+        thread.frames[0].function
+    );
+    assert!(
+        thread.frames.iter().any(|f| f.trust == "cfi"),
+        "应使用 .sym 提供的 CFI 展开"
+    );
+}
+
+/// P1-2:用户指定的主程序与 `.so` 身份不匹配时,只拒绝该候选;
+/// `.so` 仍应从 debuginfod 拉取正确版本(符号目录中的同名错误版本同理)。
+#[test]
+fn user_binary_mismatch_falls_back_to_remote() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过混合来源测试");
+        return;
+    }
+    let dir = fixture_dir("mixed");
+    let good_dir = dir.join("good");
+    fs::create_dir_all(&good_dir).unwrap();
+    build_fixture(&good_dir, None);
+    let dump = good_dir.join("crash.dmp");
+    produce_minidump(&good_dir.join("crasher"), &dump);
+
+    // 符号目录中放入同名错误版本(v2 变体,Build ID 不同)。
+    let wrong_dir = dir.join("wrong-elfs");
+    fs::create_dir_all(&wrong_dir).unwrap();
+    build_fixture(&wrong_dir, Some("v2"));
+
+    // 服务端只归档正确的 .so:调试文件与可执行镜像。
+    let mut served = Served::default();
+    for (kind, suffix) in [("debuginfo", ".debug"), ("executable", "")] {
+        served.files.insert(
+            kind.to_string(),
+            std::collections::HashMap::from([(
+                elf_build_id(&good_dir.join(format!("libcrash.so{suffix}"))),
+                good_dir.join(format!("libcrash.so{suffix}")),
+            )]),
+        );
+    }
+    let server = FakeDebuginfod::start(Arc::new(served));
+
+    let cache = dir.join("cache");
+    let opts = AnalyzeOptions {
+        symbol_paths: vec![wrong_dir],
+        user_binary: Some(good_dir.join("crasher")),
+        debuginfod_urls: vec![server.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+
+    // 主程序使用用户显式指定的本地产物。
+    let exe = report
+        .modules
+        .iter()
+        .find(|m| m.name == "crasher")
+        .expect("应有 crasher 模块");
+    match &exe.executable {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::UserSpecified { .. }),
+            "主程序应用 --binary:{origin:?}"
+        ),
+        other => panic!("主程序应匹配 --binary:{other:?}"),
+    }
+
+    // 动态库不受用户主程序/同名错误版本影响,从服务端拉取正确版本。
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .expect("应有 libcrash.so 模块");
+    match &lib.debuginfo {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::Debuginfod { .. }),
+            ".so 调试文件应来自服务端:{origin:?}"
+        ),
+        other => panic!(".so 调试文件应来自服务端:{other:?}"),
+    }
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_cfi, "远程镜像应补齐 CFI");
+            assert!(has_lines, "调试文件应提供行号");
+        }
+        other => panic!("libcrash 符号应加载:{other:?}"),
+    }
+    let thread = &report.threads[report.crashing_thread.unwrap()];
+    assert!(
+        thread.frames[0]
+            .function
+            .as_deref()
+            .unwrap_or("")
+            .contains("inner")
+    );
+    // 只有 .so 需要网络:调试文件一次、按需可执行镜像一次。
+    assert_eq!(
+        server.count("debuginfo"),
+        1,
+        "主程序用本地文件,.so 恰好一次调试文件请求"
+    );
+    assert_eq!(server.count("executable"), 1);
+}
+
+/// P1-3:按缺失的展开信息决定可执行镜像回退。
+/// 场景 A:服务端只归档可执行镜像(无调试文件)——原始 ELF 的
+/// `.eh_frame` 仍应提供 CFI 回溯;场景 B:调试文件来自本地符号目录,
+/// 可执行镜像只在远程。
+#[test]
+fn executable_only_server_still_unwinds() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过可执行镜像回退测试");
+        return;
+    }
+    let dir = fixture_dir("exeonly");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+    fs::create_dir_all(dir.join("empty")).unwrap();
+
+    let lib_bid = elf_build_id(&dir.join("libcrash.so"));
+    let served_exe_only = || {
+        let mut served = Served::default();
+        served.files.insert(
+            "executable".to_string(),
+            std::collections::HashMap::from([(lib_bid.clone(), dir.join("libcrash.so"))]),
+        );
+        served
+    };
+
+    // 场景 A:本地无产物,服务端只有可执行镜像。
+    let server = FakeDebuginfod::start(Arc::new(served_exe_only()));
+    let cache = dir.join("cache-a");
+    let opts = AnalyzeOptions {
+        symbol_paths: vec![dir.join("empty")],
+        debuginfod_urls: vec![server.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    assert!(
+        matches!(lib.debuginfo, ArtifactStatus::NotArchived { .. }),
+        "无调试文件:{:?}",
+        lib.debuginfo
+    );
+    assert!(matches!(lib.executable, ArtifactStatus::Ok { .. }));
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_cfi, "可执行镜像的 .eh_frame 应提供 CFI");
+            assert!(!has_lines, "没有调试文件时不应有行号");
+        }
+        other => panic!("符号应加载:{other:?}"),
+    }
+    let thread = &report.threads[report.crashing_thread.unwrap()];
+    assert!(
+        thread.frames.len() > 1,
+        "即使缺少行号也应能用 CFI 回溯出更多帧"
+    );
+    assert!(thread.frames.iter().any(|f| f.trust == "cfi"));
+    assert_eq!(server.count("executable"), 1);
+    assert_eq!(server.count("debuginfo"), 0);
+
+    // 场景 B:调试文件在本地符号目录,可执行镜像只在远程。
+    let debug_dir = dir.join("debugonly");
+    fs::create_dir_all(&debug_dir).unwrap();
+    fs::copy(
+        dir.join("libcrash.so.debug"),
+        debug_dir.join("libcrash.so.debug"),
+    )
+    .unwrap();
+    let server_b = FakeDebuginfod::start(Arc::new(served_exe_only()));
+    let cache_b = dir.join("cache-b");
+    let opts_b = AnalyzeOptions {
+        symbol_paths: vec![debug_dir],
+        debuginfod_urls: vec![server_b.url.clone()],
+        cache_dir: cache_b.clone(),
+        ..base_options(vec![], &cache_b)
+    };
+    let report_b = run_analyze(&dump, &opts_b);
+    let lib_b = report_b
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    match &lib_b.debuginfo {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::SymbolPath { .. }),
+            "调试文件应来自本地:{origin:?}"
+        ),
+        other => panic!("调试文件应来自本地:{other:?}"),
+    }
+    assert!(
+        matches!(lib_b.executable, ArtifactStatus::Ok { .. }),
+        "{:?}",
+        lib_b.executable
+    );
+    match &lib_b.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_cfi, "远程镜像应补齐本地调试文件缺失的 CFI");
+            assert!(has_lines);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(server_b.count("executable"), 1);
+}
+
+/// P2-8:含空格、非 ASCII 与保留字符的源码路径应按路径段百分号编码后
+/// 请求 `/source` 端点并取回文件(固件目录名自带中文与 `<>&`)。
+#[test]
+fn source_fetch_percent_encodes_special_paths() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过源码编码测试");
+        return;
+    }
+    // tag 含空格;模板自带 `<崩溃&样本>`。
+    let dir = fixture_dir("src fetch");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    let mut served = Served::default();
+    let register = |served: &mut Served, bid: String, path: PathBuf| {
+        let key = path.to_string_lossy().trim_start_matches('/').to_string();
+        served
+            .sources
+            .entry(bid)
+            .or_default()
+            .insert(key, path);
+    };
+    register(
+        &mut served,
+        elf_build_id(&dir.join("libcrash.so")),
+        dir.join("libcrash.c"),
+    );
+    register(
+        &mut served,
+        elf_build_id(&dir.join("crasher")),
+        dir.join("main.c"),
+    );
+    let server = FakeDebuginfod::start(Arc::new(served));
+
+    // 符号走本地;源码未授权本地读取,只能经 /source 端点(P1-4)。
+    let cache = dir.join("cache");
+    let opts = AnalyzeOptions {
+        symbol_paths: vec![dir.clone()],
+        debuginfod_urls: vec![server.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+    let src = report
+        .sources
+        .iter()
+        .find(|s| s.path.ends_with("libcrash.c"))
+        .expect("应有 libcrash.c 源码条目");
+    assert!(
+        matches!(src.status, SourceStatus::Embedded { .. }),
+        "{:?}",
+        src.status
+    );
+    assert!(
+        src.lines
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("CRASH_POINT"))
+    );
+    assert!(
+        server.count("source") >= 1,
+        "特殊字符路径应成功请求 /source 端点"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // CLI 冒烟测试
 // ---------------------------------------------------------------------------
 
@@ -668,6 +1082,8 @@ fn cli_analyze_writes_reports() {
         .arg(&json)
         .arg("--symbol-path")
         .arg(&dir)
+        .arg("--source-root")
+        .arg(&dir)
         .arg("--cache")
         .arg(dir.join("cache"))
         .arg("--no-debuginfod")
@@ -686,10 +1102,83 @@ fn cli_analyze_writes_reports() {
         !html_text.contains("e2e-cli-<崩溃&样本>"),
         "HTML 必须转义路径"
     );
+    // 获准的本地源码(--source-root)离线嵌入。
+    assert!(
+        html_text.contains("CRASH_POINT"),
+        "授权源码根目录后应嵌入固件源码"
+    );
     let json_text = fs::read_to_string(&json).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json_text).unwrap();
     assert_eq!(v["schema_version"], 1);
     assert!(!v["threads"].as_array().unwrap().is_empty());
+}
+
+/// P1-5:输出与输入 dump 指向同一文件(含别名)时命令必须失败,
+/// 原始 dump 字节保持一致;HTML 与 JSON 指向同一目标时同样拒绝。
+#[test]
+fn cli_refuses_to_overwrite_dump_or_sibling_report() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过输出冲突测试");
+        return;
+    }
+    let dir = fixture_dir("conflict");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+    let before = fs::read(&dump).unwrap();
+
+    let base = || {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_zminidump"));
+        cmd.arg("analyze")
+            .arg(&dump)
+            .arg("--symbol-path")
+            .arg(&dir)
+            .arg("--cache")
+            .arg(dir.join("cache"))
+            .arg("--no-debuginfod");
+        cmd
+    };
+
+    // 1. --json 指向输入 dump 本体。
+    let out = base()
+        .arg("--json")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "JSON 输出与输入 dump 同文件必须失败"
+    );
+    assert_eq!(
+        fs::read(&dump).unwrap(),
+        before,
+        "原始 dump 字节必须保持一致"
+    );
+
+    // 2. --html 指向输入 dump(以 `..` 别名形式)。
+    let alias = format!("{}/./crash.dmp", dir.display());
+    let out = base().arg("--html").arg(&alias).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "HTML 输出与输入 dump 同文件(路径别名)必须失败"
+    );
+    assert_eq!(fs::read(&dump).unwrap(), before);
+
+    // 3. --html 与 --json 指向同一目标。
+    let target = dir.join("same.out");
+    let out = base()
+        .arg("--html")
+        .arg(&target)
+        .arg("--json")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "HTML 与 JSON 输出同文件必须失败"
+    );
+    assert!(!target.exists(), "不得写出任何报告");
+    assert_eq!(fs::read(&dump).unwrap(), before);
 }
 
 /// 供调试测试使用。

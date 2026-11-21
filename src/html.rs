@@ -50,7 +50,7 @@ pre.src { overflow-x: auto; border: 1px solid color-mix(in srgb, currentColor 15
 .registers div { break-inside: avoid; }
 footer { margin-top: 2.5rem; color: color-mix(in srgb, currentColor 55%, transparent); font-size: 0.85em; }
 a { color: inherit; }
-.offset { white-space: nowrap; }
+.addr, .offset { white-space: nowrap; }
 "#;
 
 /// 渲染完整 HTML 报告。
@@ -193,7 +193,7 @@ fn render_threads(html: &mut String, report: &Report) {
         }
         let _ = writeln!(
             html,
-            "<table><thead><tr><th>#</th><th>信任</th><th>模块</th><th class=\"num\">偏移</th><th>函数</th><th>文件:行</th></tr></thead><tbody>"
+            "<table><thead><tr><th>#</th><th>信任</th><th>模块</th><th class=\"num\">指令地址</th><th class=\"num\">偏移</th><th>函数</th><th>文件:行</th></tr></thead><tbody>"
         );
         for frame in &thread.frames {
             render_frame_row(html, frame, report);
@@ -235,13 +235,16 @@ fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
         frame.source_anchor.as_ref(),
     );
 
+    // 绝对指令地址始终展示:模块归属与偏移都可能为空(例如加密主程序
+    // 的指令落入匿名映射),报告浏览者需要帧地址做手工核对。
     let _ = writeln!(
         html,
-        "<tr><td class=\"num\">{i}</td><td><span class=\"badge {bc}\">{bt}</span></td><td>{module}</td><td class=\"mono offset\">{off}</td><td class=\"mono\">{func}</td><td class=\"mono\">{file}</td></tr>",
+        "<tr><td class=\"num\">{i}</td><td><span class=\"badge {bc}\">{bt}</span></td><td>{module}</td><td class=\"mono addr\">{addr}</td><td class=\"mono offset\">{off}</td><td class=\"mono\">{func}</td><td class=\"mono\">{file}</td></tr>",
         i = frame.index,
         bc = badge_class,
         bt = badge_text,
         module = module_html,
+        addr = escape_html(&frame.instruction),
         off = frame.offset.as_deref().map(escape_html).unwrap_or_default(),
         func = func_full,
         file = file_html,
@@ -261,7 +264,7 @@ fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
         );
         let _ = writeln!(
             html,
-            "<tr class=\"muted\"><td class=\"num\">·</td><td>↳ 内联</td><td></td><td></td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>",
+            "<tr class=\"muted\"><td class=\"num\">·</td><td>↳ 内联</td><td></td><td></td><td></td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>",
             ifunc, ifile
         );
     }
@@ -565,5 +568,66 @@ mod tests {
         assert!(!html.contains("fn<&x>"));
         assert!(html.contains("候选(栈扫描)"));
         assert!(html.contains("id=\"module-0\""));
+    }
+
+    /// P2-9:HTML 栈帧必须显示绝对指令地址;无模块归属(偏移为空)的
+    /// 帧在 JSON 与 HTML 两种导出里都能查到同一个地址。
+    #[test]
+    fn html_shows_absolute_instruction_address() {
+        let report = crate::report::Report {
+            schema_version: 1,
+            tool_name: "t".into(),
+            tool_version: "0".into(),
+            dump_path: "/tmp/x.dmp".into(),
+            crash_time: None,
+            process_id: None,
+            exception: None,
+            crashing_thread: Some(0),
+            system: SystemReport {
+                os: "Linux".into(),
+                cpu: "x86_64".into(),
+                cpu_info: None,
+                os_version: None,
+            },
+            threads: vec![ThreadReport {
+                thread_id: 1,
+                name: None,
+                info: None,
+                frames: vec![FrameReport {
+                    index: 0,
+                    instruction: "0x7f01a2b3c4d5".into(),
+                    // 加密主程序的帧可能没有模块归属,偏移为空。
+                    offset: None,
+                    module_index: None,
+                    trust: "context".into(),
+                    is_candidate: false,
+                    function: None,
+                    function_offset: None,
+                    file: None,
+                    line: None,
+                    inlines: vec![],
+                    source_anchor: None,
+                }],
+                registers: None,
+            }],
+            modules: vec![],
+            sources: vec![],
+            source_mode: SourceMode::None,
+            source_omitted_count: 0,
+            source_max_bytes: 0,
+        };
+
+        // JSON 一侧始终有 `instruction` 字段。
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["threads"][0]["frames"][0]["instruction"],
+            "0x7f01a2b3c4d5"
+        );
+        // HTML 一侧也要能查到同一绝对地址。
+        let html = render_html(&report);
+        assert!(
+            html.contains("0x7f01a2b3c4d5"),
+            "HTML 栈帧应显示绝对指令地址"
+        );
     }
 }

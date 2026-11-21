@@ -99,12 +99,35 @@ impl DebuginfodClient {
     /// 获取源码文件。`path` 为 DWARF 记录的路径,去掉开头的 `/`。
     pub fn fetch_source(&self, server: &str, build_id: &str, path: &str) -> FetchResult {
         let trimmed = path.trim_start_matches('/');
-        self.fetch(&format!("{server}/buildid/{build_id}/source/{trimmed}"))
+        let encoded = encode_source_path(trimmed);
+        self.fetch(&format!("{server}/buildid/{build_id}/source/{encoded}"))
     }
 
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+}
+
+/// 按路径段对 DWARF 源码路径做百分号编码:保留目录分隔符 `/`,段内仅
+/// 保留 URI 非保留字符(字母数字与 `-._~`),其余字节(空格、非 ASCII、
+/// 保留字符)按 UTF-8 编码为 `%XX`。直接拼接原始路径会让含空格等字符
+/// 的请求在 HTTP 客户端报 `invalid uri character`。
+pub fn encode_source_path(path: &str) -> String {
+    use std::fmt::Write as _;
+    path.split('/')
+        .map(|seg| {
+            let mut enc = String::with_capacity(seg.len());
+            for b in seg.as_bytes() {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    enc.push(*b as char);
+                } else {
+                    let _ = write!(enc, "%{b:02X}");
+                }
+            }
+            enc
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 到达上限后立即停止读取的 reader。
@@ -169,5 +192,22 @@ mod tests {
         );
         assert_eq!(server_dir_name("http://127.0.0.1:8002"), "127.0.0.1_8002");
         assert_eq!(server_dir_name("  "), "server");
+    }
+
+    #[test]
+    fn source_path_encoding_keeps_separators() {
+        // 空格、非 ASCII 与保留字符按段编码,目录分隔保留。
+        assert_eq!(
+            encode_source_path("usr/src/my file.c"),
+            "usr/src/my%20file.c"
+        );
+        assert_eq!(
+            encode_source_path("build/崩溃&样本<x>.c"),
+            "build/%E5%B4%A9%E6%BA%83%26%E6%A0%B7%E6%9C%AC%3Cx%3E.c"
+        );
+        // 非保留字符保持原样;已编码的 `%` 也被再次编码。
+        assert_eq!(encode_source_path("a/b-c_d~e.f"), "a/b-c_d~e.f");
+        assert_eq!(encode_source_path("100%.c"), "100%25.c");
+        assert_eq!(encode_source_path("dir//x.c"), "dir//x.c");
     }
 }

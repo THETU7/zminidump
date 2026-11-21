@@ -27,6 +27,9 @@ pub struct AnalyzeOptions {
     pub debuginfod_urls: Vec<String>,
     pub cache_dir: PathBuf,
     pub source_mode: SourceMode,
+    /// 用户显式授权的本地源码根目录(`--source-root`);为空时不读取
+    /// 任何本机源码文件,源码只来自按 Build ID 查到的归档。
+    pub source_roots: Vec<PathBuf>,
     /// `--include-source=context` 时关键帧前后嵌入的行数。
     pub context_lines: u32,
     /// 嵌入源码总大小上限(字节)。
@@ -43,6 +46,7 @@ impl Default for AnalyzeOptions {
             debuginfod_urls: Vec::new(),
             cache_dir: default_cache_dir(),
             source_mode: SourceMode::Context,
+            source_roots: Vec::new(),
             context_lines: 3,
             max_source_bytes: 2 * 1024 * 1024,
             limits: Default::default(),
@@ -106,6 +110,7 @@ pub async fn analyze_dump(dump_path: &Path, opts: &AnalyzeOptions) -> anyhow_lik
         opts.source_mode,
         opts.context_lines,
         opts.max_source_bytes,
+        opts.source_roots.clone(),
     );
     collector.embed(&mut report, references).await;
     backfill_anchors(&mut report);
@@ -297,15 +302,16 @@ fn json_registers(ctx: &minidump::MinidumpContext) -> std::collections::BTreeMap
     out
 }
 
-/// 收集源码引用(崩溃线程优先)。
+/// 收集源码引用(崩溃线程优先)。以 (路径, Build ID) 为键:同一源码
+/// 路径可能由不同构建的模块引用,各构建的文件内容可能不同,必须分开。
 fn collect_source_references(report: &mut Report) -> Vec<(String, Option<String>, Vec<u32>)> {
     let mut ordered: Vec<(String, Option<String>, Vec<u32>)> = Vec::new();
     let mut push_ref = |path: &str, line: u32, build_id: Option<String>| {
-        if let Some(entry) = ordered.iter_mut().find(|(p, _, _)| p == path) {
+        if let Some(entry) = ordered
+            .iter_mut()
+            .find(|(p, b, _)| p == path && *b == build_id)
+        {
             entry.2.push(line);
-            if entry.1.is_none() {
-                entry.1 = build_id;
-            }
         } else {
             ordered.push((path.to_string(), build_id, vec![line]));
         }
@@ -343,18 +349,27 @@ fn collect_source_references(report: &mut Report) -> Vec<(String, Option<String>
     ordered
 }
 
-/// 嵌入源码后回填帧到源码行的锚点。
+/// 帧所属模块的 Build ID。
+fn module_build_id(modules: &[ModuleReport], index: Option<usize>) -> Option<&str> {
+    index
+        .and_then(|mi| modules.get(mi))
+        .and_then(|m| m.build_id.as_deref())
+}
+
+/// 嵌入源码后回填帧到源码行的锚点。与收集端一致,以 (路径, 模块
+/// Build ID) 为键查找源码条目,不同构建的同名文件各自跳转。
 fn backfill_anchors(report: &mut Report) {
-    let path_to_index: HashMap<&str, usize> = report
+    let key_to_index: HashMap<(&str, Option<&str>), usize> = report
         .sources
         .iter()
-        .map(|s| (s.path.as_str(), s.index))
+        .map(|s| ((s.path.as_str(), s.build_id.as_deref()), s.index))
         .collect();
     for thread in &mut report.threads {
         for frame in &mut thread.frames {
+            let build_id = module_build_id(&report.modules, frame.module_index);
             if let Some(file) = &frame.file
                 && let Some(line) = frame.line
-                && let Some(&si) = path_to_index.get(file.as_str())
+                && let Some(&si) = key_to_index.get(&(file.as_str(), build_id))
             {
                 let src = &report.sources[si];
                 if matches!(src.status, SourceStatus::Embedded { .. }) {
@@ -366,7 +381,7 @@ fn backfill_anchors(report: &mut Report) {
             }
             for inline in &mut frame.inlines {
                 if let (Some(file), Some(line)) = (&inline.file, inline.line)
-                    && let Some(&si) = path_to_index.get(file.as_str())
+                    && let Some(&si) = key_to_index.get(&(file.as_str(), build_id))
                 {
                     let src = &report.sources[si];
                     if matches!(src.status, SourceStatus::Embedded { .. }) {
@@ -378,5 +393,91 @@ fn backfill_anchors(report: &mut Report) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-7:同一路径由两个构建引用时,各模块的栈帧应回填到各自构建的
+    /// 源码条目锚点,而不是合并到同一份源码。
+    #[test]
+    fn backfill_anchors_keyed_by_build_id_and_path() {
+        let frame = |module_index: Option<usize>, line: u32| FrameReport {
+            index: 0,
+            instruction: "0x1000".into(),
+            offset: None,
+            module_index,
+            trust: "cfi".into(),
+            is_candidate: false,
+            function: None,
+            function_offset: None,
+            file: Some("/src/shared/version.c".into()),
+            line: Some(line),
+            inlines: vec![],
+            source_anchor: None,
+        };
+        let module = |index: usize, build_id: &str| ModuleReport {
+            index,
+            name: format!("m{index}"),
+            code_file: format!("/lib/m{index}.so"),
+            debug_file: None,
+            base_address: "0x0".into(),
+            size: 1,
+            debug_id: None,
+            build_id: Some(build_id.to_string()),
+            code_id: None,
+            version: None,
+            executable: ArtifactStatus::NoSource,
+            debuginfo: ArtifactStatus::NoSource,
+            symbols: SymbolStatus::Missing {
+                reason: String::new(),
+            },
+        };
+        let source = |index: usize, build_id: &str| SourceFileReport {
+            index,
+            path: "/src/shared/version.c".into(),
+            build_id: Some(build_id.to_string()),
+            status: SourceStatus::Embedded { bytes: 10 },
+            lines: Some(vec!["int version(void) { return 1; }".into()]),
+            line_ranges: Some(vec![(1, 1)]),
+        };
+
+        let mut report = Report {
+            schema_version: REPORT_SCHEMA_VERSION,
+            tool_name: TOOL_NAME.to_string(),
+            tool_version: TOOL_VERSION.to_string(),
+            dump_path: "x.dmp".into(),
+            crash_time: None,
+            process_id: None,
+            exception: None,
+            crashing_thread: Some(0),
+            system: SystemReport {
+                os: "Linux".into(),
+                cpu: "x86_64".into(),
+                cpu_info: None,
+                os_version: None,
+            },
+            threads: vec![ThreadReport {
+                thread_id: 1,
+                name: None,
+                info: None,
+                frames: vec![frame(Some(0), 1), frame(Some(1), 1)],
+                registers: None,
+            }],
+            modules: vec![module(0, "aa112233"), module(1, "bb445566")],
+            sources: vec![source(0, "aa112233"), source(1, "bb445566")],
+            source_mode: SourceMode::Context,
+            source_omitted_count: 0,
+            source_max_bytes: 1024,
+        };
+
+        backfill_anchors(&mut report);
+        let frames = &report.threads[0].frames;
+        let a = frames[0].source_anchor.as_ref().expect("构建 A 应有锚点");
+        let b = frames[1].source_anchor.as_ref().expect("构建 B 应有锚点");
+        assert_eq!(a.source_index, 0, "构建 A 的帧跳到版本 A 的源码");
+        assert_eq!(b.source_index, 1, "构建 B 的帧跳到版本 B 的源码");
     }
 }

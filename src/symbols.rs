@@ -4,7 +4,9 @@
 //! 否则用 dump_syms 从核验过的 ELF(可执行文件 + 独立调试文件)现场
 //! 生成 `.sym`,一次性提供函数名、文件行号、内联帧与 CFI 展开规则。
 //! 独立调试文件不含 `.eh_frame`,CFI 需要可执行文件;两者都匹配时
-//! 按 Build ID 合并生成。
+//! 按 Build ID 合并生成。生成的符号缺展开规则(或本地完全没有产物)
+//! 时,无论调试文件来自本地、缓存还是网络,都会尝试向 debuginfod
+//! 获取可执行镜像补齐 CFI——即使缺少源码行号也能回溯。
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -16,7 +18,7 @@ use dump_syms::{object_info::ObjectInfo, platform::Platform};
 
 use crate::{
     artifacts::{ArtifactKind, ArtifactResolver, LocalSym, ModuleIdentity, ResolvedArtifact},
-    report::{ArtifactOrigin, SymbolStatus},
+    report::SymbolStatus,
 };
 
 pub struct ArtifactSymbolSupplier {
@@ -104,44 +106,60 @@ impl SymbolSupplier for ArtifactSymbolSupplier {
             .await
             .map_err(|e| io_error(format!("符号生成任务失败:{e}")));
 
-        let mut merged = match generated {
-            Ok(Ok(info)) => info,
-            Ok(Err(reason)) => {
-                self.resolver
-                    .record_symbols(&key, SymbolStatus::Missing { reason });
-                return Err(SymbolError::NotFound);
-            }
+        let first_result: Result<ObjectInfo, String> = match generated {
+            Ok(inner) => inner,
             Err(e) => return Err(e),
         };
+        let (mut merged, mut fail_reason) = match first_result {
+            Ok(info) => (Some(info), None),
+            Err(reason) => (None, Some(reason)),
+        };
 
-        // 4. 独立调试文件来自 debuginfod 且缺少 CFI 时,按需下载可执行文件
-        //    (其 .eh_frame 提供展开规则)并重新合并。
-        if !merged.has_stack() {
-            let debug_from_net = debug
-                .as_ref()
-                .map(|d| matches!(d.origin, ArtifactOrigin::Debuginfod { .. }))
-                .unwrap_or(false);
-            let need_exe = debug_from_net && exe.is_none();
-            if need_exe
-                && let Ok(net_exe) = self
-                    .resolver
-                    .resolve(ArtifactKind::Executable, &ident)
-                    .await
-            {
-                let mut retry = vec![net_exe.path.clone()];
-                for p in &paths {
-                    if !retry.contains(p) {
-                        retry.push(p.clone());
-                    }
-                }
-                let leaf = ident.leaf.clone();
-                if let Ok(Ok(info)) =
-                    tokio::task::spawn_blocking(move || generate_from_paths(&retry, &leaf)).await
-                {
-                    merged = info;
+        // 4. 按缺失的展开信息决定是否查找可执行镜像:生成的符号缺 CFI
+        //    (或完全没有可用产物)而本地没有可执行文件时,向 debuginfod
+        //    请求 `/executable`——其 `.eh_frame` 可提供展开规则,即使没有
+        //    行号也能回溯。无论调试文件来自本地、缓存还是网络。
+        let lacks_unwind = merged
+            .as_ref()
+            .map(|m| !m.has_stack())
+            .unwrap_or(true);
+        if lacks_unwind
+            && exe.is_none()
+            && let Ok(net_exe) = self
+                .resolver
+                .resolve(ArtifactKind::Executable, &ident)
+                .await
+        {
+            let mut retry = vec![net_exe.path.clone()];
+            for p in &paths {
+                if !retry.contains(p) {
+                    retry.push(p.clone());
                 }
             }
+            let leaf = ident.leaf.clone();
+            let retry_paths = retry.clone();
+            let retry_result =
+                tokio::task::spawn_blocking(move || generate_from_paths(&retry_paths, &leaf)).await;
+            if let Ok(Ok(info)) = retry_result
+                && (info.has_stack() || merged.is_none())
+            {
+                // 远程镜像补上了 CFI,或原本完全没有产物(即使无行号也优于缺失)。
+                paths = retry;
+                merged = Some(info);
+                fail_reason = None;
+            }
+            // 否则保留首个结果:行号可能仍可用。
         }
+
+        let Some(merged) = merged else {
+            self.resolver.record_symbols(
+                &key,
+                SymbolStatus::Missing {
+                    reason: fail_reason.unwrap_or_else(|| "没有可用产物".into()),
+                },
+            );
+            return Err(SymbolError::NotFound);
+        };
 
         let has_cfi = merged.has_stack();
         let mut text = Vec::with_capacity(1 << 20);

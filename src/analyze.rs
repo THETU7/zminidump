@@ -95,7 +95,12 @@ pub async fn analyze_dump(dump_path: &Path, opts: &AnalyzeOptions) -> anyhow_lik
     let dump = Minidump::read_path(dump_path)
         .map_err(|e| format!("读取 dump {} 失败:{e}", dump_path.display()))?;
 
-    let supplier = ArtifactSymbolSupplier::new(resolver.clone());
+    // 模块列表提供 CodeView 记录类型:区分完整 GNU Build ID 与旧
+    // Breakpad PDB70 记录(其 code_identifier 是时间戳+大小,不是 Build ID)。
+    let module_list = dump
+        .get_stream::<minidump::MinidumpModuleList>()
+        .map_err(|e| format!("读取模块列表失败:{e}"))?;
+    let supplier = ArtifactSymbolSupplier::new(resolver.clone(), module_list);
     let symbolizer = Symbolizer::new(supplier);
     let state = process_minidump(&dump, &symbolizer)
         .await
@@ -135,7 +140,10 @@ async fn build_report(
     let mut module_index: HashMap<u64, usize> = HashMap::new();
     let mut modules: Vec<ModuleReport> = Vec::new();
     for module in state.modules.iter() {
-        let ident = crate::artifacts::ModuleIdentity::from_module(module);
+        let ident = crate::artifacts::ModuleIdentity::from_module_with_cv(
+            module,
+            module.codeview_info.as_ref(),
+        );
         let artifacts = resolver.finalize_module(&ident);
         let index = modules.len();
         module_index.insert(module.base_address(), index);
@@ -356,6 +364,20 @@ fn module_build_id(modules: &[ModuleReport], index: Option<usize>) -> Option<&st
         .and_then(|m| m.build_id.as_deref())
 }
 
+/// 把帧行号收敛到源码条目实际嵌入的行区间内;空文件或行号超出实际
+/// 内容时给出最近的有效行,保证锚点目标(页内 `src-<i>-L<l>`)存在。
+/// 无任何嵌入行时返回 `None`(不生成失效锚点)。
+fn anchor_line(line: u32, ranges: &[(u32, u32)]) -> Option<u32> {
+    let (first, last) = (ranges.first()?, ranges.last()?);
+    Some(if line < first.0 {
+        first.0
+    } else if line > last.1 {
+        last.1
+    } else {
+        line
+    })
+}
+
 /// 嵌入源码后回填帧到源码行的锚点。与收集端一致,以 (路径, 模块
 /// Build ID) 为键查找源码条目,不同构建的同名文件各自跳转。
 fn backfill_anchors(report: &mut Report) {
@@ -364,32 +386,36 @@ fn backfill_anchors(report: &mut Report) {
         .iter()
         .map(|s| ((s.path.as_str(), s.build_id.as_deref()), s.index))
         .collect();
+    let anchor_target = |sources: &[SourceFileReport], si: usize, line: u32| {
+        let src = sources.get(si)?;
+        if matches!(src.status, SourceStatus::Embedded { .. }) {
+            anchor_line(line, src.line_ranges.as_deref().unwrap_or(&[]))
+        } else {
+            None
+        }
+    };
     for thread in &mut report.threads {
         for frame in &mut thread.frames {
             let build_id = module_build_id(&report.modules, frame.module_index);
             if let Some(file) = &frame.file
                 && let Some(line) = frame.line
                 && let Some(&si) = key_to_index.get(&(file.as_str(), build_id))
+                && let Some(target) = anchor_target(&report.sources, si, line)
             {
-                let src = &report.sources[si];
-                if matches!(src.status, SourceStatus::Embedded { .. }) {
-                    frame.source_anchor = Some(SourceAnchor {
-                        source_index: si,
-                        line,
-                    });
-                }
+                frame.source_anchor = Some(SourceAnchor {
+                    source_index: si,
+                    line: target,
+                });
             }
             for inline in &mut frame.inlines {
                 if let (Some(file), Some(line)) = (&inline.file, inline.line)
                     && let Some(&si) = key_to_index.get(&(file.as_str(), build_id))
+                    && let Some(target) = anchor_target(&report.sources, si, line)
                 {
-                    let src = &report.sources[si];
-                    if matches!(src.status, SourceStatus::Embedded { .. }) {
-                        inline.source_anchor = Some(SourceAnchor {
-                            source_index: si,
-                            line,
-                        });
-                    }
+                    inline.source_anchor = Some(SourceAnchor {
+                        source_index: si,
+                        line: target,
+                    });
                 }
             }
         }
@@ -402,6 +428,8 @@ mod tests {
 
     /// P2-7:同一路径由两个构建引用时,各模块的栈帧应回填到各自构建的
     /// 源码条目锚点,而不是合并到同一份源码。
+    /// R2-P1:空文件不生成锚点;超出实际行数的帧行号收敛到嵌入区间内,
+    /// 避免指向不存在的 `src-<i>-L<l>` 目标。
     #[test]
     fn backfill_anchors_keyed_by_build_id_and_path() {
         let frame = |module_index: Option<usize>, line: u32| FrameReport {
@@ -463,11 +491,34 @@ mod tests {
                 thread_id: 1,
                 name: None,
                 info: None,
-                frames: vec![frame(Some(0), 1), frame(Some(1), 1)],
+                frames: vec![
+                    frame(Some(0), 1),
+                    frame(Some(1), 1),
+                    // 行号超出源码条目实际嵌入的行区间。
+                    frame(Some(0), 10),
+                    // 引用空文件(嵌入 0 行)的构建。
+                    frame(Some(2), 3),
+                ],
                 registers: None,
             }],
-            modules: vec![module(0, "aa112233"), module(1, "bb445566")],
-            sources: vec![source(0, "aa112233"), source(1, "bb445566")],
+            modules: vec![
+                module(0, "aa112233"),
+                module(1, "bb445566"),
+                module(2, "cc778899"),
+            ],
+            sources: vec![
+                source(0, "aa112233"),
+                source(1, "bb445566"),
+                // 空文件:嵌入零行,不得生成失效锚点。
+                SourceFileReport {
+                    index: 2,
+                    path: "/src/shared/version.c".into(),
+                    build_id: Some("cc778899".to_string()),
+                    status: SourceStatus::Embedded { bytes: 0 },
+                    lines: Some(vec![]),
+                    line_ranges: Some(vec![]),
+                },
+            ],
             source_mode: SourceMode::Context,
             source_omitted_count: 0,
             source_max_bytes: 1024,
@@ -479,5 +530,10 @@ mod tests {
         let b = frames[1].source_anchor.as_ref().expect("构建 B 应有锚点");
         assert_eq!(a.source_index, 0, "构建 A 的帧跳到版本 A 的源码");
         assert_eq!(b.source_index, 1, "构建 B 的帧跳到版本 B 的源码");
+        // 超出区间的行号收敛到最近的有效行(此处区间为 (1,1))。
+        let clamped = frames[2].source_anchor.as_ref().expect("应生成收敛锚点");
+        assert_eq!((clamped.source_index, clamped.line), (0, 1));
+        // 空文件不生成锚点。
+        assert!(frames[3].source_anchor.is_none(), "空文件不得生成失效锚点");
     }
 }

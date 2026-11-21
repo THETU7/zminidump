@@ -298,15 +298,12 @@ fn real_crash_unwinds_to_source_lines_with_cfi() {
     produce_minidump(&dir.join("crasher"), &dump);
     assert!(dump.metadata().unwrap().len() > 0);
 
-    let report = run_analyze(
-        &dump,
-        &{
-            let mut opts = base_options(vec![dir.clone()], &dir.join("cache"));
-            // P1-4:本地源码嵌入需要显式授权固件目录为源码根目录。
-            opts.source_roots = vec![dir.clone()];
-            opts
-        },
-    );
+    let report = run_analyze(&dump, &{
+        let mut opts = base_options(vec![dir.clone()], &dir.join("cache"));
+        // P1-4:本地源码嵌入需要显式授权固件目录为源码根目录。
+        opts.source_roots = vec![dir.clone()];
+        opts
+    });
 
     // 异常与崩溃线程。
     let exception = report.exception.as_ref().expect("应有异常记录");
@@ -509,6 +506,8 @@ struct Served {
     files: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
     /// build_id → 源码相对路径(去掉开头 `/`)→ 文件。
     sources: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
+    /// 对所有 `/source` 请求返回 503(模拟服务端故障)。
+    sources_always_error: bool,
 }
 
 /// 请求路径里的百分号编码解码(服务端视角)。
@@ -599,6 +598,16 @@ fn handle(
     } else {
         ""
     };
+    if segments.len() >= 4
+        && segments[0] == "buildid"
+        && segments[2] == "source"
+        && served.sources_always_error
+    {
+        stream
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        return;
+    }
     if let Some(bytes) = hit {
         *hits
             .lock()
@@ -1006,11 +1015,7 @@ fn source_fetch_percent_encodes_special_paths() {
     let mut served = Served::default();
     let register = |served: &mut Served, bid: String, path: PathBuf| {
         let key = path.to_string_lossy().trim_start_matches('/').to_string();
-        served
-            .sources
-            .entry(bid)
-            .or_default()
-            .insert(key, path);
+        served.sources.entry(bid).or_default().insert(key, path);
     };
     register(
         &mut served,
@@ -1053,6 +1058,332 @@ fn source_fetch_percent_encodes_special_paths() {
     assert!(
         server.count("source") >= 1,
         "特殊字符路径应成功请求 /source 端点"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 第二轮复核回归(R2)
+// ---------------------------------------------------------------------------
+
+/// 把 dump 副本中指定模块的 CodeView 记录改写为历史 Breakpad PDB70
+/// 格式:GUID 取原 ELF Build ID 的前 16 字节,Age 0。模拟旧 Linux
+/// Breakpad 写出的 dump(其 code_identifier 是时间戳+镜像大小)。
+fn patch_module_cv_to_pdb70(dump: &Path, module_leaf: &str, out: &Path) {
+    let mut bytes = fs::read(dump).unwrap();
+    let rd_u32 = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    assert_eq!(&bytes[0..4], b"MDMP", "应为 minidump 文件");
+    let num_streams = rd_u32(&bytes, 8) as usize;
+    let dir_rva = rd_u32(&bytes, 12) as usize;
+
+    // 目录项:StreamType u32 + Location{DataSize u32, Rva u32}。
+    let mut list_rva = None;
+    for i in 0..num_streams {
+        let e = dir_rva + i * 12;
+        if rd_u32(&bytes, e) == 4 {
+            // ModuleListStream。
+            list_rva = Some(rd_u32(&bytes, e + 8) as usize);
+        }
+    }
+    let list = list_rva.expect("dump 应含模块列表流");
+
+    // MINIDUMP_MODULE 布局:BaseOfImage u64 | SizeOfImage/CheckSum/
+    // TimeDateStamp/ModuleNameRva 各 u32(偏移 8..24)| VS_FIXEDFILEINFO
+    // 52 字节(24..76)| CvRecord{DataSize,Rva}(76..84)| 其余。
+    // 注意:位置描述符在本格式中是 DataSize 在前、Rva 在后。
+    const MODULE_SIZE: usize = 108;
+    let count = rd_u32(&bytes, list) as usize;
+    for i in 0..count {
+        let m = list + 4 + i * MODULE_SIZE;
+        let name_rva = rd_u32(&bytes, m + 20) as usize;
+        let name_len = rd_u32(&bytes, name_rva) as usize;
+        let name_utf16: Vec<u16> = bytes[name_rva + 4..name_rva + 4 + name_len]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if !String::from_utf16_lossy(&name_utf16).ends_with(module_leaf) {
+            continue;
+        }
+        let old_size = rd_u32(&bytes, m + 76) as usize;
+        let old_rva = rd_u32(&bytes, m + 80) as usize;
+        assert!(old_size >= 20, "原 CodeView 记录应含 Build ID");
+        // PDB70:RSDS 签名 + 原 Build ID 前 16 字节(GUID 布局逐字节相同,
+        // 保证 DebugId 不变)+ Age 0 + 空路径。
+        let mut record = Vec::with_capacity(25);
+        record.extend_from_slice(&0x5344_5352u32.to_le_bytes()); // "RSDS"
+        record.extend_from_slice(&bytes[old_rva + 4..old_rva + 20]);
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.push(0);
+        let new_rva = bytes.len() as u32;
+        bytes.extend_from_slice(&record);
+        bytes[m + 76..m + 80].copy_from_slice(&(record.len() as u32).to_le_bytes());
+        bytes[m + 80..m + 84].copy_from_slice(&new_rva.to_le_bytes());
+        fs::write(out, &bytes).unwrap();
+        return;
+    }
+    panic!("dump 中未找到模块 {module_leaf}");
+}
+
+/// R2-P1:旧 Linux Breakpad 的 PDB70 记录承载截短 GUID,其
+/// code_identifier(时间戳+大小)不是 Build ID;GUID 相同的同一 `.debug`
+/// 应仍能按前缀匹配加载,行号与 CFI 均可用。
+#[test]
+fn legacy_pdb70_module_still_matches_artifacts() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过 PDB70 兼容测试");
+        return;
+    }
+    let dir = fixture_dir("pdb70");
+    let (crash_line, _) = build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    let patched = dir.join("crash-pdb70.dmp");
+    patch_module_cv_to_pdb70(&dump, "libcrash.so", &patched);
+
+    // 符号目录提供正确的 .debug 与剥离镜像(与未打补丁的 dump 相同)。
+    let report = run_analyze(
+        &patched,
+        &base_options(vec![dir.clone()], &dir.join("cache")),
+    );
+
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .expect("应有 libcrash.so 模块");
+    assert!(
+        matches!(lib.debuginfo, ArtifactStatus::Ok { .. }),
+        "PDB70 历史记录应按 GUID 前缀匹配 .debug:{:?}",
+        lib.debuginfo
+    );
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_cfi);
+            assert!(has_lines);
+        }
+        other => panic!("libcrash 符号应加载:{other:?}"),
+    }
+    let thread = &report.threads[report.crashing_thread.unwrap()];
+    let frame0 = &thread.frames[0];
+    assert!(
+        frame0.function.as_deref().unwrap_or("").contains("inner"),
+        "{:?}",
+        frame0.function
+    );
+    assert_eq!(frame0.line, Some(crash_line));
+    // 现代 ELF 完整 ID 不同即拒绝的行为由 wrong_build_id_elf_is_rejected
+    // 与单元测试覆盖。
+}
+
+/// R2-P1:符号目录只有剥离后的发布物(无 DWARF)时,不得因本地命中
+/// 而跳过远程;独立 `.debug` 仍应从 debuginfod 拉取,本地镜像继续
+/// 提供展开。CFI、函数与行号都应可用。
+#[test]
+fn stripped_local_elf_still_fetches_remote_debuginfo() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过剥离镜像远程调试文件测试");
+        return;
+    }
+    let dir = fixture_dir("stripped");
+    let (crash_line, _) = build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    // 符号目录只放剥离后的发布物。
+    let stripped_dir = dir.join("stripped-only");
+    fs::create_dir_all(&stripped_dir).unwrap();
+    for name in ["crasher", "libcrash.so"] {
+        fs::copy(dir.join(name), stripped_dir.join(name)).unwrap();
+    }
+
+    // 服务端归档正确的独立 .debug。
+    let mut served = Served::default();
+    served.files.insert(
+        "debuginfo".to_string(),
+        std::collections::HashMap::from([(
+            elf_build_id(&dir.join("libcrash.so")),
+            dir.join("libcrash.so.debug"),
+        )]),
+    );
+    let server = FakeDebuginfod::start(Arc::new(served));
+
+    let cache = dir.join("cache");
+    let opts = AnalyzeOptions {
+        symbol_paths: vec![stripped_dir],
+        debuginfod_urls: vec![server.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    match &lib.debuginfo {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::Debuginfod { .. }),
+            "缺少 DWARF 的本地命中不应阻断远程 .debug:{origin:?}"
+        ),
+        other => panic!("应从服务端获取调试文件:{other:?}"),
+    }
+    assert!(
+        matches!(lib.executable, ArtifactStatus::Ok { .. }),
+        "本地剥离镜像保留用于展开:{:?}",
+        lib.executable
+    );
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_cfi, "本地镜像提供 CFI");
+            assert!(has_lines, "远程 .debug 提供行号");
+        }
+        other => panic!("{other:?}"),
+    }
+    let thread = &report.threads[report.crashing_thread.unwrap()];
+    assert!(
+        thread.frames[0]
+            .function
+            .as_deref()
+            .unwrap_or("")
+            .contains("inner")
+    );
+    assert_eq!(thread.frames[0].line, Some(crash_line));
+    assert_eq!(
+        server.count("debuginfo"),
+        1,
+        "本地剥离命中后仍应请求一次远程 .debug"
+    );
+
+    // 第二次分析:本地剥离镜像不再遮蔽缓存,命中上次下载的 .debug。
+    let report2 = run_analyze(&dump, &opts);
+    let lib2 = report2
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    assert!(matches!(lib2.debuginfo, ArtifactStatus::Ok { .. }));
+    assert!(matches!(lib2.symbols, SymbolStatus::Loaded { .. }));
+    assert_eq!(
+        server.count("debuginfo"),
+        1,
+        "第二次分析应命中缓存,不重复下载"
+    );
+}
+
+/// R2-P2:源码服务出错(503)时继续尝试备用服务器与已授权的本地目录,
+/// 所有来源都失败才报告获取错误。
+#[test]
+fn source_fetch_falls_back_on_server_error() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过源码备用来源测试");
+        return;
+    }
+    let dir = fixture_dir("srcfail");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    // 源码归档:libcrash.c(lib 的 Build ID)。
+    let mut served_ok = Served::default();
+    let lib_bid = elf_build_id(&dir.join("libcrash.so"));
+    let lib_src = dir.join("libcrash.c");
+    served_ok.sources.insert(
+        lib_bid.clone(),
+        std::collections::HashMap::from([(
+            lib_src
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string(),
+            lib_src.clone(),
+        )]),
+    );
+    // 故障服务:所有 /source 请求返回 503。
+    let failing = FakeDebuginfod::start(Arc::new(Served {
+        sources_always_error: true,
+        ..Default::default()
+    }));
+
+    // 1. 首个来源 503,第二个来源有文件 → 嵌入成功。
+    let backup = FakeDebuginfod::start(Arc::new(served_ok));
+    let cache = dir.join("cache");
+    let opts = AnalyzeOptions {
+        symbol_paths: vec![dir.clone()],
+        debuginfod_urls: vec![failing.url.clone(), backup.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+    let src = report
+        .sources
+        .iter()
+        .find(|s| s.path.ends_with("libcrash.c"))
+        .expect("应有 libcrash.c 源码条目");
+    assert!(
+        matches!(src.status, SourceStatus::Embedded { .. }),
+        "服务出错后应继续尝试备用来源:{:?}",
+        src.status
+    );
+    assert!(
+        src.lines
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("CRASH_POINT"))
+    );
+    assert_eq!(backup.count("source"), 1, "备用服务器应收到源码请求");
+
+    // 2. 唯一的来源持续出错,本地源码根目录已授权 → 离线嵌入。
+    let failing2 = FakeDebuginfod::start(Arc::new(Served {
+        sources_always_error: true,
+        ..Default::default()
+    }));
+    let cache2 = dir.join("cache2");
+    let opts2 = AnalyzeOptions {
+        symbol_paths: vec![dir.clone()],
+        debuginfod_urls: vec![failing2.url.clone()],
+        cache_dir: cache2.clone(),
+        source_roots: vec![dir.clone()],
+        ..base_options(vec![], &cache2)
+    };
+    let report2 = run_analyze(&dump, &opts2);
+    let src2 = report2
+        .sources
+        .iter()
+        .find(|s| s.path.ends_with("libcrash.c"))
+        .expect("应有 libcrash.c 源码条目");
+    assert!(
+        matches!(src2.status, SourceStatus::Embedded { .. }),
+        "服务出错后应回退到获准的本地源码:{:?}",
+        src2.status
+    );
+
+    // 3. 唯一的来源出错且未授权本地目录 → 保留获取失败诊断。
+    let failing3 = FakeDebuginfod::start(Arc::new(Served {
+        sources_always_error: true,
+        ..Default::default()
+    }));
+    let cache3 = dir.join("cache3");
+    let opts3 = AnalyzeOptions {
+        symbol_paths: vec![dir.clone()],
+        debuginfod_urls: vec![failing3.url.clone()],
+        cache_dir: cache3.clone(),
+        ..base_options(vec![], &cache3)
+    };
+    let report3 = run_analyze(&dump, &opts3);
+    let src3 = report3
+        .sources
+        .iter()
+        .find(|s| s.path.ends_with("libcrash.c"))
+        .expect("应有 libcrash.c 源码条目");
+    assert!(
+        matches!(src3.status, SourceStatus::FetchFailed { .. }),
+        "所有来源失败时报告获取错误:{:?}",
+        src3.status
     );
 }
 
@@ -1140,15 +1471,8 @@ fn cli_refuses_to_overwrite_dump_or_sibling_report() {
     };
 
     // 1. --json 指向输入 dump 本体。
-    let out = base()
-        .arg("--json")
-        .arg(&dump)
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "JSON 输出与输入 dump 同文件必须失败"
-    );
+    let out = base().arg("--json").arg(&dump).output().unwrap();
+    assert!(!out.status.success(), "JSON 输出与输入 dump 同文件必须失败");
     assert_eq!(
         fs::read(&dump).unwrap(),
         before,
@@ -1173,12 +1497,36 @@ fn cli_refuses_to_overwrite_dump_or_sibling_report() {
         .arg(&target)
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "HTML 与 JSON 输出同文件必须失败"
-    );
+    assert!(!out.status.success(), "HTML 与 JSON 输出同文件必须失败");
     assert!(!target.exists(), "不得写出任何报告");
     assert_eq!(fs::read(&dump).unwrap(), before);
+
+    // 4. --json 指向输入 dump 的硬链接(不同路径名,同一 inode)。
+    let hard_json = dir.join("hard-json.out");
+    std::fs::hard_link(&dump, &hard_json).unwrap();
+    let out = base().arg("--json").arg(&hard_json).output().unwrap();
+    assert!(!out.status.success(), "输出与输入互为硬链接必须失败");
+    assert_eq!(
+        fs::read(&dump).unwrap(),
+        before,
+        "硬链接目标(即输入)字节必须保持一致"
+    );
+
+    // 5. 两个输出互为硬链接。
+    let h1 = dir.join("out-a.html");
+    let h2 = dir.join("out-b.json");
+    std::fs::write(&h1, b"").unwrap();
+    std::fs::hard_link(&h1, &h2).unwrap();
+    let out = base()
+        .arg("--html")
+        .arg(&h1)
+        .arg("--json")
+        .arg(&h2)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "两个输出互为硬链接必须失败");
+    assert_eq!(fs::read(&dump).unwrap(), before);
+    assert_eq!(fs::read(&h1).unwrap(), b"", "硬链接输出不得被写入");
 }
 
 /// 供调试测试使用。

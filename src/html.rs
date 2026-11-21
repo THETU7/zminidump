@@ -285,10 +285,12 @@ fn render_file_line(
 ) -> String {
     match (file, line) {
         (Some(file), Some(line)) => match anchor {
+            // 链接目标用锚点行号(已收敛到实际嵌入的行区间),
+            // 显示文本保留原始行号。
             Some(a) => format!(
                 "<a href=\"#src-{}-L{}\">{}</a>",
                 a.source_index,
-                line,
+                a.line,
                 escape_html(&format!("{file}:{line}"))
             ),
             None => escape_html(&format!("{file}:{line}")),

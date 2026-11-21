@@ -196,9 +196,36 @@ fn lexical_absolute(p: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
+/// 已存在文件的唯一身份:Unix 上为设备号 + inode(同一文件的不同
+/// 硬链接名在此相等,canonicalize 无法识别);Windows 上退化为
+/// 规范化路径比较。
+fn file_key(p: &std::path::Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(p).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
+}
+
 /// 判断两个路径是否指向同一文件;覆盖相对路径、`..`、符号链接与硬链接
 /// 别名等情形,防止报告输出覆盖输入 dump 或先前的报告。
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    // 双方都已存在:比较文件身份(硬链接也视为同一文件)。
+    if let (Some(x), Some(y)) = (file_key(a), file_key(b)) {
+        #[cfg(unix)]
+        {
+            return x == y;
+        }
+        #[cfg(windows)]
+        {
+            let _ = (x, y);
+        }
+    }
     match (resolve_for_compare(a), resolve_for_compare(b)) {
         (Some(x), Some(y)) => x == y,
         _ => lexical_absolute(a) == lexical_absolute(b),
@@ -311,19 +338,23 @@ mod tests {
         std::fs::write(&other, b"x").unwrap();
         assert!(!same_file(&other, &dump));
 
-        // 符号链接别名。
+        // 符号链接别名与硬链接别名(不同路径名指向同一文件)。
         #[cfg(unix)]
         {
             let alias = dir.join("alias.dmp");
             std::os::unix::fs::symlink(&dump, &alias).unwrap();
             assert!(same_file(&alias, &dump));
+
+            let hardlink = dir.join("hard.dmp");
+            std::fs::hard_link(&dump, &hardlink).unwrap();
+            assert!(
+                same_file(&hardlink, &dump),
+                "硬链接指向同一 inode,必须视为同一文件"
+            );
         }
 
         // 输出文件尚不存在:退化为词法比较,`..` 与相对路径仍可识别。
-        assert!(same_file(
-            Path::new("a/../b.html"),
-            Path::new("b.html")
-        ));
+        assert!(same_file(Path::new("a/../b.html"), Path::new("b.html")));
         assert!(!same_file(Path::new("b.html"), Path::new("c.html")));
 
         std::fs::remove_dir_all(&dir).ok();

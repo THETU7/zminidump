@@ -23,11 +23,23 @@ use crate::{
 
 pub struct ArtifactSymbolSupplier {
     resolver: Arc<ArtifactResolver>,
+    /// dump 的模块列表:提供 CodeView 记录类型,用于区分完整 GNU Build ID
+    /// 与旧 Breakpad PDB70 的截短 GUID。
+    modules: minidump::MinidumpModuleList,
 }
 
 impl ArtifactSymbolSupplier {
-    pub fn new(resolver: Arc<ArtifactResolver>) -> Self {
-        Self { resolver }
+    pub fn new(resolver: Arc<ArtifactResolver>, modules: minidump::MinidumpModuleList) -> Self {
+        Self { resolver, modules }
+    }
+
+    /// 按 dump 的 CodeView 记录类型提取模块身份。
+    fn identity_for(&self, module: &(dyn Module + Sync)) -> ModuleIdentity {
+        let cv = self
+            .modules
+            .module_at_address(module.base_address())
+            .and_then(|m| m.codeview_info.as_ref());
+        ModuleIdentity::from_module_with_cv(module, cv)
     }
 }
 
@@ -37,7 +49,7 @@ impl SymbolSupplier for ArtifactSymbolSupplier {
         &self,
         module: &(dyn Module + Sync),
     ) -> Result<LocateSymbolsResult, SymbolError> {
-        let ident = ModuleIdentity::from_module(module);
+        let ident = self.identity_for(module);
         let key = ident.key();
 
         // 1. 预生成 .sym(CI 产物)。
@@ -119,10 +131,7 @@ impl SymbolSupplier for ArtifactSymbolSupplier {
         //    (或完全没有可用产物)而本地没有可执行文件时,向 debuginfod
         //    请求 `/executable`——其 `.eh_frame` 可提供展开规则,即使没有
         //    行号也能回溯。无论调试文件来自本地、缓存还是网络。
-        let lacks_unwind = merged
-            .as_ref()
-            .map(|m| !m.has_stack())
-            .unwrap_or(true);
+        let lacks_unwind = merged.as_ref().map(|m| !m.has_stack()).unwrap_or(true);
         if lacks_unwind
             && exe.is_none()
             && let Ok(net_exe) = self
@@ -221,7 +230,7 @@ impl SymbolSupplier for ArtifactSymbolSupplier {
         module: &(dyn Module + Sync),
         file_kind: FileKind,
     ) -> Result<PathBuf, FileError> {
-        let ident = ModuleIdentity::from_module(module);
+        let ident = self.identity_for(module);
         let kind = match file_kind {
             FileKind::Binary => ArtifactKind::Executable,
             FileKind::ExtraDebugInfo | FileKind::BreakpadSym => ArtifactKind::DebugInfo,

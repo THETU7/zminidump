@@ -124,25 +124,31 @@ impl SourceCollector {
             match fetched {
                 Ok(content) => {
                     let all_lines = split_lines(&content);
-                    let (ranges, selected) = match self.mode {
-                        SourceMode::Full => {
-                            let sel = all_lines.clone();
-                            let n = sel.len().max(1) as u32;
-                            (vec![(1, n)], sel)
-                        }
-                        _ => {
-                            let ranges = merge_ranges(
-                                file_ref.lines.iter().copied(),
-                                self.context_lines,
-                                all_lines.len() as u32,
-                            );
-                            let sel = ranges
-                                .iter()
-                                .flat_map(|(a, b)| {
-                                    all_lines[(*a as usize - 1)..(*b as usize)].to_vec()
-                                })
-                                .collect();
-                            (ranges, sel)
+                    // 空文件没有第 1 行:嵌入零行内容,不生成任何区间,
+                    // 锚点回填也会跳过(避免指向不存在的行)。
+                    let (ranges, selected) = if all_lines.is_empty() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        match self.mode {
+                            SourceMode::Full => {
+                                let sel = all_lines.clone();
+                                let n = sel.len() as u32;
+                                (vec![(1, n)], sel)
+                            }
+                            _ => {
+                                let ranges = merge_ranges(
+                                    file_ref.lines.iter().copied(),
+                                    self.context_lines,
+                                    all_lines.len() as u32,
+                                );
+                                let sel = ranges
+                                    .iter()
+                                    .flat_map(|(a, b)| {
+                                        all_lines[(*a as usize - 1)..(*b as usize)].to_vec()
+                                    })
+                                    .collect();
+                                (ranges, sel)
+                            }
                         }
                     };
                     let bytes: usize = selected.iter().map(|l| l.len() + 1).sum();
@@ -186,8 +192,12 @@ impl SourceCollector {
     /// 获取源码内容:按 Build ID 的归档缓存 → debuginfod `/source` →
     /// 用户显式授权的本地源码根目录。默认(未配置根目录)绝不读取
     /// 本机文件,避免把与报告构建无关的内容嵌入报告。
+    ///
+    /// 单个服务出错(网络、5xx 等)不中断查找:保留诊断后继续尝试其余
+    /// 服务与本地目录;所有来源都失败时才报告获取错误。
     async fn fetch_file(&self, path: &str, build_id: Option<&str>) -> Result<String, SourceStatus> {
         let mut not_archived = false;
+        let mut last_error: Option<SourceStatus> = None;
 
         // 1. 按 Build ID 查找:各服务器缓存 → debuginfod /source。
         if let Some(build_id) = build_id {
@@ -224,14 +234,15 @@ impl SourceCollector {
                     }
                     Ok(FetchResult::NotFound) => {
                         not_archived = true;
-                        continue;
                     }
                     Ok(FetchResult::Failed(message)) => {
-                        return Err(SourceStatus::FetchFailed { message });
+                        last_error = Some(SourceStatus::FetchFailed {
+                            message: format!("({server}):{message}"),
+                        });
                     }
                     Err(e) => {
-                        return Err(SourceStatus::FetchFailed {
-                            message: format!("下载任务失败:{e}"),
+                        last_error = Some(SourceStatus::FetchFailed {
+                            message: format!("({server}):下载任务失败:{e}"),
                         });
                     }
                 }
@@ -239,15 +250,16 @@ impl SourceCollector {
         }
 
         // 2. 用户显式授权的本地源码根目录;解析后的路径必须仍位于根内。
-        //    归档中未找到时,本地获准的源码仍可离线嵌入。
+        //    归档中未找到或服务出错时,本地获准的源码仍可离线嵌入。
         if let Some(text) = self.read_local_authorized(path) {
             return Ok(text);
         }
 
-        Err(if not_archived {
-            SourceStatus::NotArchived
-        } else {
-            SourceStatus::NotFound
+        Err(match last_error {
+            // 服务出错的诊断保留到最后;未归档次之。
+            Some(e) => e,
+            None if not_archived => SourceStatus::NotArchived,
+            None => SourceStatus::NotFound,
         })
     }
 
@@ -290,6 +302,7 @@ fn split_lines(text: &str) -> Vec<String> {
 }
 
 /// 合并行号 ±context 的重叠区间,输出 1 起始的闭区间列表(有序)。
+/// 文件没有内容(`total == 0`)时返回空:不存在可嵌入的行。
 pub fn merge_ranges<I: IntoIterator<Item = u32>>(
     lines: I,
     context: u32,
@@ -298,11 +311,10 @@ pub fn merge_ranges<I: IntoIterator<Item = u32>>(
     let mut wanted: Vec<u32> = lines.into_iter().filter(|l| *l >= 1).collect();
     wanted.sort_unstable();
     wanted.dedup();
-    if wanted.is_empty() {
+    if wanted.is_empty() || total == 0 {
         return Vec::new();
     }
     let mut ranges: Vec<(u32, u32)> = Vec::new();
-    let total = total.max(1);
     for line in wanted {
         let line = line.min(total);
         let start = line.saturating_sub(context).max(1);
@@ -486,10 +498,7 @@ mod tests {
     /// 配置包含该文件的根目录后才允许离线嵌入;根目录之外的路径仍被拒绝。
     #[tokio::test]
     async fn local_read_requires_authorized_source_root() {
-        let file_dir = std::env::temp_dir().join(format!(
-            "zmsrc-auth-file-{}",
-            std::process::id()
-        ));
+        let file_dir = std::env::temp_dir().join(format!("zmsrc-auth-file-{}", std::process::id()));
         std::fs::create_dir_all(&file_dir).unwrap();
         let src = file_dir.join("secret.c");
         std::fs::write(&src, "int leak(void) { return 1; }\n").unwrap();
@@ -511,17 +520,16 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
 
         // 2. 显式授权包含该文件的根目录 → 嵌入。
-        let (collector, dir) = make_collector(
-            "auth-ok",
-            SourceMode::Full,
-            10_000,
-            vec![file_dir.clone()],
-        );
+        let (collector, dir) =
+            make_collector("auth-ok", SourceMode::Full, 10_000, vec![file_dir.clone()]);
         let mut report = empty_report(SourceMode::Full, 10_000);
         collector
             .embed(&mut report, vec![(path.clone(), None, vec![1u32])])
             .await;
-        assert!(matches!(report.sources[0].status, SourceStatus::Embedded { .. }));
+        assert!(matches!(
+            report.sources[0].status,
+            SourceStatus::Embedded { .. }
+        ));
         assert!(
             report.sources[0]
                 .lines
@@ -534,10 +542,8 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
 
         // 3. 授权的根目录不包含该路径(位于根外)→ 拒绝。
-        let other_root = std::env::temp_dir().join(format!(
-            "zmsrc-auth-other-{}",
-            std::process::id()
-        ));
+        let other_root =
+            std::env::temp_dir().join(format!("zmsrc-auth-other-{}", std::process::id()));
         std::fs::create_dir_all(&other_root).unwrap();
         let (collector, dir) = make_collector(
             "auth-out",
@@ -625,6 +631,47 @@ mod tests {
         // 10 ±2 与 11 ±2 合并为 8..=13;120 超出总行数时收敛到末尾。
         let ranges = merge_ranges(vec![10, 11, 100], 2, 50);
         assert_eq!(ranges, vec![(8, 13), (48, 50)]);
+    }
+
+    /// R2-P1:空文件(成功返回 200/读到 0 字节)不得使 context 模式
+    /// 中断:嵌入零行内容,保留有意义的源码状态。
+    #[tokio::test]
+    async fn empty_source_embeds_zero_lines_without_panic() {
+        let file_dir = std::env::temp_dir().join(format!("zmsrc-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let empty = file_dir.join("empty.c");
+        std::fs::write(&empty, "").unwrap();
+
+        let (collector, dir) =
+            make_collector("empty", SourceMode::Context, 10_000, vec![file_dir.clone()]);
+        let mut report = empty_report(SourceMode::Context, 10_000);
+        collector
+            .embed(
+                &mut report,
+                vec![(
+                    empty.to_string_lossy().into_owned(),
+                    None,
+                    vec![10u32], // 引用行号超出空文件的实际行数。
+                )],
+            )
+            .await;
+
+        assert_eq!(report.sources.len(), 1);
+        let src = &report.sources[0];
+        assert!(
+            matches!(src.status, SourceStatus::Embedded { bytes: 0 }),
+            "空文件应正常嵌入(0 字节):{:?}",
+            src.status
+        );
+        assert_eq!(src.lines.as_deref(), Some(&[][..]));
+        assert_eq!(src.line_ranges.as_deref(), Some(&[][..]));
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(file_dir).ok();
+    }
+
+    #[test]
+    fn merge_ranges_empty_total_is_empty() {
+        assert!(merge_ranges(vec![10], 3, 0).is_empty());
     }
 
     #[test]

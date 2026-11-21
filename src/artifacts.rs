@@ -44,7 +44,7 @@ impl ArtifactKind {
 pub struct ModuleIdentity {
     /// Breakpad Debug ID(ELF 上来自 Build ID 前 16 字节的 GUID)。
     pub debug_id: Option<DebugId>,
-    /// Code ID;Linux ELF 上即完整 GNU Build ID(小写十六进制)。
+    /// Code ID;仅当 CodeView 记录确认其为完整 GNU Build ID 时才可信。
     pub code_id: Option<CodeId>,
     /// code_file 的文件名。
     pub leaf: String,
@@ -57,6 +57,28 @@ impl ModuleIdentity {
             code_id: module.code_identifier(),
             leaf: crate::util::basename(&module.code_file()),
         }
+    }
+
+    /// 按 dump 的 CodeView 记录类型提取完整 GNU Build ID。
+    ///
+    /// 只有 ELF 记录的 `code_identifier()` 是完整 Build ID;旧 Linux
+    /// Breakpad 用 PDB70 记录承载截短 GUID,其 `code_identifier()` 由
+    /// 时间戳和镜像大小组成,不是 Build ID,不得用于完整比较——
+    /// 否则 GUID 相同的历史 dump 会被误判为身份不匹配。
+    pub fn from_module_with_cv(module: &dyn Module, cv: Option<&minidump::CodeView>) -> Self {
+        let mut ident = Self::from_module(module);
+        match cv {
+            Some(minidump::CodeView::Elf(raw)) if !raw.build_id.iter().all(|b| *b == 0) => {
+                ident.code_id = Some(CodeId::new(hex_lower(&raw.build_id)));
+            }
+            Some(minidump::CodeView::Pdb70(_)) | Some(minidump::CodeView::Pdb20(_)) => {
+                // 历史 Breakpad 记录:只有截短 GUID,回退到前缀匹配。
+                ident.code_id = None;
+            }
+            // 无记录(Windows 回退语义)或未知格式:保留 trait 的原始值。
+            _ => {}
+        }
+        ident
     }
 
     /// 完整 GNU Build ID(小写十六进制),优先取 Code ID。
@@ -208,6 +230,8 @@ pub struct LocalSym {
     pub path: PathBuf,
     /// .sym MODULE 行中的 Debug ID。
     pub debug_id: String,
+    /// `INFO CODE_ID` 行中的完整身份;缺失时为 `None`(历史格式)。
+    pub code_id: Option<String>,
     pub name: String,
 }
 
@@ -306,15 +330,27 @@ impl LocalIndex {
         })
     }
 
-    /// 按 Breakpad Debug ID 查找预生成 `.sym`。
+    /// 按 Breakpad Debug ID 查找预生成 `.sym`。dump 与 `.sym` 都带有
+    /// 完整身份(`INFO CODE_ID`)时必须一致:截短 GUID 相同但完整身份
+    /// 不同的是另一个构建,其行号与展开规则不得混用;不匹配的候选
+    /// 跳过,继续查找其他候选。
     pub fn find_sym(&self, ident: &ModuleIdentity) -> Option<&LocalSym> {
         let debug = ident.debug_id?;
         // .sym 的 MODULE 行使用 Breakpad 格式:无连字符的大写 GUID + Age,
         // 而非 DebugId 的普通显示格式(带连字符 UUID)。
         let wanted = debug.breakpad().to_string();
-        self.syms
-            .iter()
-            .find(|s| s.debug_id.eq_ignore_ascii_case(&wanted))
+        let full = ident.full_build_id();
+        self.syms.iter().find(|s| {
+            if !s.debug_id.eq_ignore_ascii_case(&wanted) {
+                return false;
+            }
+            match (&full, &s.code_id) {
+                // 双方都有完整身份:必须一致。
+                (Some(want), Some(have)) => have.eq_ignore_ascii_case(want),
+                // 历史格式(.sym 或 dump 缺完整身份):保持兼容。
+                _ => true,
+            }
+        })
     }
 }
 
@@ -326,12 +362,14 @@ fn looks_like_debug_file(path: &Path) -> bool {
         || path.to_string_lossy().ends_with(".dwo")
 }
 
-/// 解析 `.sym` 文件首行 `MODULE <os> <arch> <id> <name>`。
+/// 解析 `.sym` 文件首行 `MODULE <os> <arch> <id> <name>` 及可选的
+/// `INFO CODE_ID <id> [<name>]` 行。
 fn probe_sym_file(path: &Path) -> Option<LocalSym> {
     use std::io::BufRead;
     let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
     let mut line = String::new();
-    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    reader.read_line(&mut line).ok()?;
     let mut parts = line.split_whitespace();
     if parts.next()? != "MODULE" {
         return None;
@@ -340,9 +378,25 @@ fn probe_sym_file(path: &Path) -> Option<LocalSym> {
     let _arch = parts.next()?;
     let debug_id = parts.next()?.to_string();
     let name = parts.next().unwrap_or("").to_string();
+    // INFO CODE_ID 行在文件头部(MODULE 之后、首个 FUNC/STACK 之前)。
+    let mut code_id = None;
+    for _ in 0..64 {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("INFO CODE_ID ") {
+            code_id = rest.split_whitespace().next().map(str::to_string);
+            break;
+        }
+        if line.starts_with("FUNC ") || line.starts_with("STACK ") || line.starts_with("PUBLIC ") {
+            break;
+        }
+    }
     Some(LocalSym {
         path: path.to_path_buf(),
         debug_id,
+        code_id,
         name,
     })
 }
@@ -496,8 +550,36 @@ impl ArtifactResolver {
         // 本地(用户指定 + 扫描)与缓存。身份不匹配只否定对应的单个候选
         // (例如用户指定的主程序对 `.so` 模块必然不匹配),不得据此阻断
         // 对同一模块的其他来源(缓存、debuginfod)的查找。
-        let local_mismatch = match self.local_and_cache(kind, ident) {
-            Ok(a) => return Ok(a),
+        let local = self.local_and_cache(kind, ident);
+
+        // 本地命中的调试文件不含 DWARF(例如符号目录里只有剥离后的
+        // 发布镜像)时,它对 `DebugInfo` 的价值有限:保留为回退,继续向
+        // debuginfod 请求真正的独立 `.debug`。本地镜像仍用于展开。
+        let stripped_debug_fallback = match &local {
+            Ok(a)
+                if kind == ArtifactKind::DebugInfo
+                    && !a.has_debug_info
+                    && ident.full_build_id().is_some()
+                    && !self.cfg.debuginfod_urls.is_empty()
+                    && matches!(
+                        a.origin,
+                        ArtifactOrigin::UserSpecified { .. } | ArtifactOrigin::SymbolPath { .. }
+                    ) =>
+            {
+                Some(a.clone())
+            }
+            _ => None,
+        };
+
+        let local_mismatch = match local {
+            Ok(a) => {
+                if stripped_debug_fallback.is_some() {
+                    // 继续尝试网络,失败时回退到本地剥离产物。
+                } else {
+                    return Ok(a);
+                }
+                None
+            }
             Err(status) => {
                 if matches!(status, ArtifactStatus::IdentityMismatch { .. }) {
                     Some(status)
@@ -509,18 +591,24 @@ impl ArtifactResolver {
 
         match self.fetch_remote(kind, ident).await {
             Ok(a) => Ok(a),
-            // 网络也未取得时,保留本地身份不匹配的诊断价值。
-            Err(remote) => match local_mismatch {
-                Some(m)
-                    if matches!(
-                        remote,
-                        ArtifactStatus::NoSource | ArtifactStatus::NotArchived { .. }
-                    ) =>
-                {
-                    Err(m)
+            Err(remote) => {
+                // 远程没有更好的调试文件:回退到本地剥离产物(仍可用于展开)。
+                if let Some(fallback) = stripped_debug_fallback {
+                    return Ok(fallback);
                 }
-                _ => Err(remote),
-            },
+                // 网络也未取得时,保留本地身份不匹配的诊断价值。
+                match local_mismatch {
+                    Some(m)
+                        if matches!(
+                            remote,
+                            ArtifactStatus::NoSource | ArtifactStatus::NotArchived { .. }
+                        ) =>
+                    {
+                        Err(m)
+                    }
+                    _ => Err(remote),
+                }
+            }
         }
     }
 
@@ -576,16 +664,24 @@ impl ArtifactResolver {
             }
         }
 
-        // 2. 本地扫描索引。
+        // 2. 本地扫描索引。调试文件候选缺少 DWARF(剥离后的发布镜像)时
+        // 先不返回:继续查缓存(可能有此前下载的真正 .debug),避免
+        // 每次分析都重新下载。
+        let mut stripped_local: Option<ResolvedArtifact> = None;
         if let Some(elf) = self.local.find_elf(ident, kind) {
-            return Ok(ResolvedArtifact {
+            let artifact = ResolvedArtifact {
                 path: elf.path.clone(),
                 origin: ArtifactOrigin::SymbolPath {
                     path: elf.path.display().to_string(),
                 },
                 build_id: elf.meta.build_id.clone().unwrap_or_default(),
                 has_debug_info: elf.meta.has_debug_info,
-            });
+            };
+            if kind == ArtifactKind::DebugInfo && !artifact.has_debug_info {
+                stripped_local = Some(artifact);
+            } else {
+                return Ok(artifact);
+            }
         }
 
         // 3. 缓存(此前从 debuginfod 下载)。
@@ -605,6 +701,9 @@ impl ArtifactResolver {
                     });
                 }
             }
+        }
+        if let Some(stripped) = stripped_local {
+            return Ok(stripped);
         }
 
         // 3.5 扫描目录中有同名文件但 Build ID 不符 → 报告身份不匹配。
@@ -909,12 +1008,17 @@ mod tests {
         let sym = dir.join("test.sym");
         fs::write(
             &sym,
-            "MODULE Linux x86_64 4F2A1B0C3D4E5F60718293A4B5C6D7E80 libtest.so\n",
+            "MODULE Linux x86_64 4F2A1B0C3D4E5F60718293A4B5C6D7E80 libtest.so\n\
+             INFO CODE_ID aa112233445566778899aabbccddeeff0011 libtest.so\n",
         )
         .unwrap();
         let probed = probe_sym_file(&sym).unwrap();
         assert_eq!(probed.name, "libtest.so");
         assert_eq!(probed.debug_id.len(), 33); // 32 hex + age
+        assert_eq!(
+            probed.code_id.as_deref(),
+            Some("aa112233445566778899aabbccddeeff0011")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -954,6 +1058,165 @@ mod tests {
         let other_bytes = hex_to_bytes("00112233445566778899aabbccddeeff").unwrap();
         ident.debug_id = Some(debugid::DebugId::from_guid_age(&other_bytes, 0).unwrap());
         assert!(index.find_sym(&ident).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 测试桩:实现 minidump 的 Module trait,可控身份标识。
+    struct StubModule {
+        debug_id: Option<DebugId>,
+        code_id: Option<CodeId>,
+    }
+
+    impl minidump::Module for StubModule {
+        fn base_address(&self) -> u64 {
+            0x1000
+        }
+        fn size(&self) -> u64 {
+            1
+        }
+        fn code_file(&self) -> std::borrow::Cow<'_, str> {
+            "/lib/libtest.so".into()
+        }
+        fn code_identifier(&self) -> Option<CodeId> {
+            self.code_id.clone()
+        }
+        fn debug_file(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+        fn debug_identifier(&self) -> Option<DebugId> {
+            self.debug_id
+        }
+        fn version(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+    }
+
+    /// R2-P1:按 CodeView 记录类型区分完整 GNU Build ID 与旧 Breakpad
+    /// PDB70 记录(后者的 code_identifier 是时间戳+大小,不是 Build ID)。
+    #[test]
+    fn from_module_with_cv_distinguishes_build_id_sources() {
+        let build_id = "aa112233445566778899aabbccddeeff0011";
+        let bytes = hex_to_bytes(build_id).unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes[..16], 0).unwrap();
+
+        // 现代 ELF 记录:code_identifier 即完整 Build ID。
+        let elf_module = StubModule {
+            debug_id: Some(debug),
+            code_id: Some(CodeId::new(build_id.into())),
+        };
+        let cv_elf = minidump::CodeView::Elf(minidump::format::CV_INFO_ELF {
+            cv_signature: 0,
+            build_id: bytes.clone(),
+        });
+        let modern = ModuleIdentity::from_module_with_cv(&elf_module, Some(&cv_elf));
+        assert_eq!(modern.full_build_id().as_deref(), Some(build_id));
+        let meta = ElfMeta {
+            build_id: Some(build_id.into()),
+            has_debug_info: true,
+            has_exec_segments: true,
+        };
+        assert_eq!(match_identity(&meta, &modern), Some(IdMatch::Full));
+
+        // 旧 PDB70 记录:GUID 相同,code_identifier 是时间戳+大小 →
+        // 不得当作完整 Build ID,按截短 GUID 回退匹配同一产物。
+        let pdb_module = StubModule {
+            debug_id: Some(debug),
+            code_id: Some(CodeId::new("DEADBEEF1a2b3c".into())),
+        };
+        let cv_pdb = minidump::CodeView::Pdb70(minidump::format::CV_INFO_PDB70 {
+            cv_signature: 0x5344_5352,
+            signature: minidump::format::GUID {
+                data1: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                data2: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+                data3: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+                data4: bytes[8..16].try_into().unwrap(),
+            },
+            age: 0,
+            pdb_file_name: vec![0],
+        });
+        let legacy = ModuleIdentity::from_module_with_cv(&pdb_module, Some(&cv_pdb));
+        assert_eq!(
+            legacy.full_build_id(),
+            None,
+            "PDB70 的时间戳+大小不是 Build ID"
+        );
+        assert_eq!(
+            match_identity(&meta, &legacy),
+            Some(IdMatch::TruncatedGuid),
+            "历史 PDB70 记录应按 GUID 前缀匹配同一 .debug"
+        );
+
+        // 无 CodeView 记录:保留 trait 的原始值(CodeId 规整为小写)。
+        let no_cv = ModuleIdentity::from_module_with_cv(&pdb_module, None);
+        assert_eq!(
+            no_cv.code_id.map(|c| c.as_str().to_string()),
+            Some("deadbeef1a2b3c".into())
+        );
+    }
+
+    /// R2-P2:dump 与 .sym 都带完整身份时核对 `INFO CODE_ID`;
+    /// 截短 GUID 相同但完整身份不同的是另一个构建,必须跳过。
+    #[test]
+    fn sym_code_id_is_verified_when_available() {
+        let dir = std::env::temp_dir().join(format!("zmsymcid-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = hex_to_bytes("4f2a1b0c3d4e5f60718293a4b5c6d7e8").unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes, 0).unwrap();
+        let module_line = format!("MODULE Linux x86_64 {} libtest.so", debug.breakpad());
+
+        // 两个 .sym:同一 MODULE 截短 ID,不同完整 CODE_ID。
+        fs::write(
+            dir.join("a.sym"),
+            format!("{module_line}\nINFO CODE_ID aa112233445566778899aabbccddeeff0011\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.sym"),
+            format!("{module_line}\nINFO CODE_ID bb112233445566778899aabbccddeeff0022\n"),
+        )
+        .unwrap();
+        let index = LocalIndex::scan(std::slice::from_ref(&dir));
+
+        // dump 完整 ID 匹配 a → 命中 a;匹配 b → 命中 b。
+        let want = |id: &str| {
+            let mut i = ident(Some(id), None);
+            i.debug_id = Some(debug);
+            i
+        };
+        assert!(
+            index
+                .find_sym(&want("aa112233445566778899aabbccddeeff0011"))
+                .expect("完整 ID 一致应命中")
+                .path
+                .ends_with("a.sym")
+        );
+        assert!(
+            index
+                .find_sym(&want("bb112233445566778899aabbccddeeff0022"))
+                .expect("完整 ID 一致应命中")
+                .path
+                .ends_with("b.sym")
+        );
+
+        // dump 完整 ID 不匹配任何候选 → 全部跳过(不用其他构建的符号)。
+        assert!(
+            index
+                .find_sym(&want("cc112233445566778899aabbccddeeff0033"))
+                .is_none(),
+            "CODE_ID 不符的 .sym 必须跳过"
+        );
+
+        // 历史 .sym(无 INFO CODE_ID)保持兼容。
+        fs::remove_file(dir.join("a.sym")).unwrap();
+        fs::remove_file(dir.join("b.sym")).unwrap();
+        fs::write(dir.join("legacy.sym"), format!("{module_line}\n")).unwrap();
+        let index = LocalIndex::scan(std::slice::from_ref(&dir));
+        assert!(
+            index
+                .find_sym(&want("aa112233445566778899aabbccddeeff0011"))
+                .is_some(),
+            "无 INFO CODE_ID 的历史 .sym 应兼容命中"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

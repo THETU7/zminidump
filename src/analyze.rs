@@ -97,9 +97,15 @@ pub async fn analyze_dump(dump_path: &Path, opts: &AnalyzeOptions) -> anyhow_lik
 
     // 模块列表提供 CodeView 记录类型:区分完整 GNU Build ID 与旧
     // Breakpad PDB70 记录(其 code_identifier 是时间戳+大小,不是 Build ID)。
-    let module_list = dump
-        .get_stream::<minidump::MinidumpModuleList>()
-        .map_err(|e| format!("读取模块列表失败:{e}"))?;
+    // 缺少或无法读取模块列表时与 minidump-processor 一致:用空列表
+    // 继续分析异常、线程和已捕获的绝对地址,并在报告中说明。
+    let (module_list, mut notes) = match dump.get_stream::<minidump::MinidumpModuleList>() {
+        Ok(list) => (list, Vec::new()),
+        Err(e) => (
+            minidump::MinidumpModuleList::new(),
+            vec![format!("缺少或无法读取模块列表流({e}),模块信息为空")],
+        ),
+    };
     let supplier = ArtifactSymbolSupplier::new(resolver.clone(), module_list);
     let symbolizer = Symbolizer::new(supplier);
     let state = process_minidump(&dump, &symbolizer)
@@ -107,6 +113,7 @@ pub async fn analyze_dump(dump_path: &Path, opts: &AnalyzeOptions) -> anyhow_lik
         .map_err(|e| format!("处理 dump 失败:{e}"))?;
 
     let mut report = build_report(dump_path, &state, &resolver).await;
+    report.notes.append(&mut notes);
 
     // 源码嵌入:崩溃线程引用在前,保证预算优先用于关键帧。
     let references = collect_source_references(&mut report);
@@ -276,6 +283,7 @@ async fn build_report(
         threads,
         modules,
         sources: Vec::new(),
+        notes: Vec::new(),
         source_mode: SourceMode::None,
         source_omitted_count: 0,
         source_max_bytes: 0,
@@ -364,18 +372,13 @@ fn module_build_id(modules: &[ModuleReport], index: Option<usize>) -> Option<&st
         .and_then(|m| m.build_id.as_deref())
 }
 
-/// 把帧行号收敛到源码条目实际嵌入的行区间内;空文件或行号超出实际
-/// 内容时给出最近的有效行,保证锚点目标(页内 `src-<i>-L<l>`)存在。
-/// 无任何嵌入行时返回 `None`(不生成失效锚点)。
-fn anchor_line(line: u32, ranges: &[(u32, u32)]) -> Option<u32> {
-    let (first, last) = (ranges.first()?, ranges.last()?);
-    Some(if line < first.0 {
-        first.0
-    } else if line > last.1 {
-        last.1
-    } else {
-        line
-    })
+/// 帧行号必须落在源码条目实际嵌入的行区间内才生成锚点;越界行
+/// (行号超出实际文件内容)不生成链接,由导出端提示该行不可用。
+fn embedded_line(line: u32, ranges: &[(u32, u32)]) -> Option<u32> {
+    ranges
+        .iter()
+        .find(|(a, b)| *a <= line && line <= *b)
+        .map(|_| line)
 }
 
 /// 嵌入源码后回填帧到源码行的锚点。与收集端一致,以 (路径, 模块
@@ -389,7 +392,7 @@ fn backfill_anchors(report: &mut Report) {
     let anchor_target = |sources: &[SourceFileReport], si: usize, line: u32| {
         let src = sources.get(si)?;
         if matches!(src.status, SourceStatus::Embedded { .. }) {
-            anchor_line(line, src.line_ranges.as_deref().unwrap_or(&[]))
+            embedded_line(line, src.line_ranges.as_deref().unwrap_or(&[]))
         } else {
             None
         }
@@ -519,6 +522,7 @@ mod tests {
                     line_ranges: Some(vec![]),
                 },
             ],
+            notes: Vec::new(),
             source_mode: SourceMode::Context,
             source_omitted_count: 0,
             source_max_bytes: 1024,
@@ -530,9 +534,13 @@ mod tests {
         let b = frames[1].source_anchor.as_ref().expect("构建 B 应有锚点");
         assert_eq!(a.source_index, 0, "构建 A 的帧跳到版本 A 的源码");
         assert_eq!(b.source_index, 1, "构建 B 的帧跳到版本 B 的源码");
-        // 超出区间的行号收敛到最近的有效行(此处区间为 (1,1))。
-        let clamped = frames[2].source_anchor.as_ref().expect("应生成收敛锚点");
-        assert_eq!((clamped.source_index, clamped.line), (0, 1));
+        // 行号超出嵌入区间(此处区间为 (1,1))时不生成锚点:
+        // 不得链接到其他行冒充实际位置。
+        assert!(
+            frames[2].source_anchor.is_none(),
+            "越界行不得生成锚点:{:?}",
+            frames[2].source_anchor
+        );
         // 空文件不生成锚点。
         assert!(frames[3].source_anchor.is_none(), "空文件不得生成失效锚点");
     }

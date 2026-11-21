@@ -197,18 +197,32 @@ fn lexical_absolute(p: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// 已存在文件的唯一身份:Unix 上为设备号 + inode(同一文件的不同
-/// 硬链接名在此相等,canonicalize 无法识别);Windows 上退化为
-/// 规范化路径比较。
-fn file_key(p: &std::path::Path) -> Option<(u64, u64)> {
-    let meta = std::fs::metadata(p).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
-    }
-    #[cfg(windows)]
-    {
-        None
+/// 硬链接名在此相等,canonicalize 无法识别)。
+#[cfg(unix)]
+fn same_existing_files(a: &std::path::Path, b: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let x = std::fs::metadata(a).ok()?;
+    let y = std::fs::metadata(b).ok()?;
+    Some((x.dev(), x.ino()) == (y.dev(), y.ino()))
+}
+
+/// Windows 上的同文件判定:以独占共享模式依次打开两个文件。NTFS 上
+/// 同一文件的第二次独占打开会因共享冲突失败(不同硬链接名也一样);
+/// 其他进程占用导致的失败也会被保守地视为同一文件(宁可拒绝写入)。
+#[cfg(windows)]
+fn same_existing_files(a: &std::path::Path, b: &std::path::Path) -> Option<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let open_exclusive = |p: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .access_mode(0) // 仅查询属性
+            .share_mode(0) // 独占
+            .open(p)
+    };
+    let _ha = open_exclusive(a).ok()?;
+    match open_exclusive(b) {
+        Ok(_hb) => Some(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => Some(true),
     }
 }
 
@@ -216,15 +230,11 @@ fn file_key(p: &std::path::Path) -> Option<(u64, u64)> {
 /// 别名等情形,防止报告输出覆盖输入 dump 或先前的报告。
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     // 双方都已存在:比较文件身份(硬链接也视为同一文件)。
-    if let (Some(x), Some(y)) = (file_key(a), file_key(b)) {
-        #[cfg(unix)]
-        {
-            return x == y;
-        }
-        #[cfg(windows)]
-        {
-            let _ = (x, y);
-        }
+    if a.is_file()
+        && b.is_file()
+        && let Some(same) = same_existing_files(a, b)
+    {
+        return same;
     }
     match (resolve_for_compare(a), resolve_for_compare(b)) {
         (Some(x), Some(y)) => x == y,

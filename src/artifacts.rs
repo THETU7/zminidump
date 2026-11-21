@@ -339,18 +339,26 @@ impl LocalIndex {
         // .sym 的 MODULE 行使用 Breakpad 格式:无连字符的大写 GUID + Age,
         // 而非 DebugId 的普通显示格式(带连字符 UUID)。
         let wanted = debug.breakpad().to_string();
-        let full = ident.full_build_id();
-        self.syms.iter().find(|s| {
-            if !s.debug_id.eq_ignore_ascii_case(&wanted) {
-                return false;
-            }
-            match (&full, &s.code_id) {
-                // 双方都有完整身份:必须一致。
-                (Some(want), Some(have)) => have.eq_ignore_ascii_case(want),
-                // 历史格式(.sym 或 dump 缺完整身份):保持兼容。
-                _ => true,
-            }
-        })
+        let matched: Vec<&LocalSym> = self
+            .syms
+            .iter()
+            .filter(|s| s.debug_id.eq_ignore_ascii_case(&wanted))
+            .collect();
+        let Some(full) = ident.full_build_id() else {
+            // dump 无完整身份:只能按截短 GUID 匹配。
+            return matched.first().copied();
+        };
+        // 1. 完整身份精确匹配优先——不得让先扫描到的历史格式抢先命中。
+        if let Some(exact) = matched.iter().find(|s| {
+            s.code_id
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case(&full))
+                .unwrap_or(false)
+        }) {
+            return Some(*exact);
+        }
+        // 2. 完整 ID 明确不符的是其他构建,跳过;只剩历史格式回退。
+        matched.iter().find(|s| s.code_id.is_none()).copied()
     }
 }
 
@@ -619,7 +627,10 @@ impl ArtifactResolver {
     ) -> Result<ResolvedArtifact, ArtifactStatus> {
         let mut mismatch: Option<ArtifactStatus> = None;
 
-        // 1. 用户显式指定的文件。
+        // 1. 用户显式指定的文件。显式指定的调试文件缺少 DWARF(剥离后的
+        // 发布镜像)时不提前返回:保留为最后回退,优先用带 DWARF 的本地
+        // 产物或缓存,服务不可用时已下载的 .debug 仍能提供行号。
+        let mut user_stripped: Option<ResolvedArtifact> = None;
         let user_path = match kind {
             ArtifactKind::Executable => self.cfg.user_binary.clone(),
             ArtifactKind::DebugInfo => self.cfg.user_debug_file.clone(),
@@ -629,12 +640,19 @@ impl ArtifactResolver {
             match probe_elf_file(&path) {
                 Some(meta) => {
                     if match_identity(&meta, ident).is_some() {
-                        return Ok(ResolvedArtifact {
-                            path,
-                            origin: ArtifactOrigin::UserSpecified { path: path_display },
-                            build_id: meta.build_id.unwrap_or_default(),
+                        let artifact = ResolvedArtifact {
+                            path: path.clone(),
+                            origin: ArtifactOrigin::UserSpecified {
+                                path: path_display.clone(),
+                            },
+                            build_id: meta.build_id.clone().unwrap_or_default(),
                             has_debug_info: meta.has_debug_info,
-                        });
+                        };
+                        if kind == ArtifactKind::DebugInfo && !artifact.has_debug_info {
+                            user_stripped = Some(artifact);
+                        } else {
+                            return Ok(artifact);
+                        }
                     }
                     // dump 无身份时,允许按文件名辅助匹配用户指定的主程序。
                     if ident.debug_id.is_none()
@@ -702,7 +720,8 @@ impl ArtifactResolver {
                 }
             }
         }
-        if let Some(stripped) = stripped_local {
+        // 无 DWARF 的候选只作最后回退:用户显式文件优先于扫描命中。
+        if let Some(stripped) = user_stripped.or(stripped_local) {
             return Ok(stripped);
         }
 
@@ -1059,6 +1078,49 @@ mod tests {
         ident.debug_id = Some(debugid::DebugId::from_guid_age(&other_bytes, 0).unwrap());
         assert!(index.find_sym(&ident).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R3-P2:有完整 Build ID 时先查找完整匹配的 `.sym`;先扫描到的
+    /// 历史格式(缺 INFO CODE_ID)不得抢先命中;目录顺序互换结果不变。
+    #[test]
+    fn find_sym_prefers_exact_code_id_over_earlier_legacy() {
+        let root = std::env::temp_dir().join(format!("zmsymorder-{}", std::process::id()));
+        let dir_legacy = root.join("d1");
+        let dir_exact = root.join("d2");
+        fs::create_dir_all(&dir_legacy).unwrap();
+        fs::create_dir_all(&dir_exact).unwrap();
+        let bytes = hex_to_bytes("4f2a1b0c3d4e5f60718293a4b5c6d7e8").unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes, 0).unwrap();
+        let module_line = format!("MODULE Linux x86_64 {} libtest.so", debug.breakpad());
+        // d1:历史 .sym(无 INFO CODE_ID);d2:完整 ID 精确匹配。
+        fs::write(dir_legacy.join("legacy.sym"), format!("{module_line}\n")).unwrap();
+        fs::write(
+            dir_exact.join("exact.sym"),
+            format!("{module_line}\nINFO CODE_ID aa112233445566778899aabbccddeeff0011\n"),
+        )
+        .unwrap();
+
+        let mut ident = ident(Some("aa112233445566778899aabbccddeeff0011"), None);
+        ident.debug_id = Some(debug);
+        for order in [
+            vec![dir_legacy.clone(), dir_exact.clone()],
+            vec![dir_exact.clone(), dir_legacy.clone()],
+        ] {
+            let index = LocalIndex::scan(&order);
+            let found = index.find_sym(&ident).expect("应命中 .sym");
+            assert!(
+                found.path.ends_with("exact.sym"),
+                "完整匹配优先,目录顺序无关:{}",
+                found.path.display()
+            );
+        }
+
+        // 移除精确 .sym 后才回退到历史格式。
+        fs::remove_file(dir_exact.join("exact.sym")).unwrap();
+        let index = LocalIndex::scan(&[dir_legacy, dir_exact]);
+        let found = index.find_sym(&ident).expect("应回退到历史格式");
+        assert!(found.path.ends_with("legacy.sym"));
+        fs::remove_dir_all(root).ok();
     }
 
     /// 测试桩:实现 minidump 的 Module trait,可控身份标识。

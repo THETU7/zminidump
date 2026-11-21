@@ -293,6 +293,9 @@ pub struct Report {
     pub threads: Vec<ThreadReport>,
     pub modules: Vec<ModuleReport>,
     pub sources: Vec<SourceFileReport>,
+    /// 分析过程中降级或缺失的重要信息(例如缺少模块列表流)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub source_mode: SourceMode,
     /// 因总大小上限被省略嵌入的文件数。
     pub source_omitted_count: usize,

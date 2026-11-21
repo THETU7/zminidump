@@ -117,6 +117,15 @@ fn render_header(html: &mut String, report: &Report) {
         );
     }
 
+    // 分析过程中的降级/缺失提示(如缺少模块列表流)。
+    if !report.notes.is_empty() {
+        let _ = writeln!(
+            html,
+            "<div class=\"card\"><p class=\"warn\">⚠ {}</p></div>",
+            escape_html(&report.notes.join("; "))
+        );
+    }
+
     let _ = writeln!(html, "<div class=\"card\">");
     let sys = &report.system;
     let _ = writeln!(
@@ -202,7 +211,7 @@ fn render_threads(html: &mut String, report: &Report) {
     }
 }
 
-fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
+fn render_frame_row(html: &mut String, frame: &FrameReport, report: &Report) {
     let (badge_class, badge_text) = match frame.trust.as_str() {
         "context" => ("ctx", "上下文"),
         "cfi" => ("cfi", "CFI"),
@@ -215,7 +224,7 @@ fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
         .map(|mi| {
             format!(
                 "<a href=\"#module-{mi}\">{}</a>",
-                escape_html(&_module_name(_report, mi))
+                escape_html(&_module_name(report, mi))
             )
         })
         .unwrap_or_else(|| "<span class=\"muted\">??</span>".to_string());
@@ -233,6 +242,12 @@ fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
         frame.file.as_deref(),
         frame.line,
         frame.source_anchor.as_ref(),
+        frame
+            .file
+            .as_deref()
+            .zip(frame.line)
+            .map(|(f, l)| line_missing_from_embedded(report, f, l))
+            .unwrap_or(false),
     );
 
     // 绝对指令地址始终展示:模块归属与偏移都可能为空(例如加密主程序
@@ -261,6 +276,12 @@ fn render_frame_row(html: &mut String, frame: &FrameReport, _report: &Report) {
             inline.file.as_deref(),
             inline.line,
             inline.source_anchor.as_ref(),
+            inline
+                .file
+                .as_deref()
+                .zip(inline.line)
+                .map(|(f, l)| line_missing_from_embedded(report, f, l))
+                .unwrap_or(false),
         );
         let _ = writeln!(
             html,
@@ -278,19 +299,38 @@ fn _module_name(report: &Report, index: usize) -> String {
         .unwrap_or_default()
 }
 
+/// 帧行号是否落在某个已嵌入源码条目的区间之外(行号超出实际文件内容)。
+fn line_missing_from_embedded(report: &Report, file: &str, line: u32) -> bool {
+    report.sources.iter().any(|s| {
+        s.path == file
+            && matches!(s.status, SourceStatus::Embedded { .. })
+            && !s
+                .line_ranges
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|(a, b)| *a <= line && line <= *b)
+    })
+}
+
 fn render_file_line(
     file: Option<&str>,
     line: Option<u32>,
     anchor: Option<&SourceAnchor>,
+    line_unavailable: bool,
 ) -> String {
     match (file, line) {
         (Some(file), Some(line)) => match anchor {
-            // 链接目标用锚点行号(已收敛到实际嵌入的行区间),
-            // 显示文本保留原始行号。
             Some(a) => format!(
                 "<a href=\"#src-{}-L{}\">{}</a>",
                 a.source_index,
                 a.line,
+                escape_html(&format!("{file}:{line}"))
+            ),
+            // 越界行保留原始文件与行号,并提示该行在当前源码中不可用,
+            // 不得链接到其他行冒充实际崩溃位置。
+            None if line_unavailable => format!(
+                "{} <span class=\"muted\" title=\"调试信息中的行号超出嵌入的源码内容\">⚠ 该行未嵌入</span>",
                 escape_html(&format!("{file}:{line}"))
             ),
             None => escape_html(&format!("{file}:{line}")),
@@ -559,6 +599,7 @@ mod tests {
                 lines: Some(vec!["l1 <b>".into(), "l2 &".into(), "l3".into()]),
                 line_ranges: Some(vec![(1, 3)]),
             }],
+            notes: Vec::new(),
             source_mode: SourceMode::Context,
             source_omitted_count: 0,
             source_max_bytes: 10,
@@ -570,6 +611,84 @@ mod tests {
         assert!(!html.contains("fn<&x>"));
         assert!(html.contains("候选(栈扫描)"));
         assert!(html.contains("id=\"module-0\""));
+    }
+
+    /// R3-P2:行号超出嵌入源码内容时不生成链接,保留原始文件与行号
+    /// 并提示该行不可用;已嵌入的行正常链接。
+    #[test]
+    fn html_marks_out_of_range_source_lines() {
+        let frame = |line: Option<u32>, anchor: Option<SourceAnchor>| FrameReport {
+            index: 0,
+            instruction: "0x1000".into(),
+            offset: None,
+            module_index: Some(0),
+            trust: "cfi".into(),
+            is_candidate: false,
+            function: Some("fn".into()),
+            function_offset: None,
+            file: Some("/src/short.c".into()),
+            line,
+            inlines: vec![],
+            source_anchor: anchor,
+        };
+        let report = Report {
+            schema_version: 1,
+            tool_name: "t".into(),
+            tool_version: "0".into(),
+            dump_path: "/tmp/x.dmp".into(),
+            crash_time: None,
+            process_id: None,
+            exception: None,
+            crashing_thread: Some(0),
+            system: SystemReport {
+                os: "Linux".into(),
+                cpu: "x86_64".into(),
+                cpu_info: None,
+                os_version: None,
+            },
+            threads: vec![ThreadReport {
+                thread_id: 1,
+                name: None,
+                info: None,
+                // 帧 0:行 1 已嵌入(带锚点);帧 1:行 28 越界(无锚点)。
+                frames: vec![
+                    frame(
+                        Some(1),
+                        Some(SourceAnchor {
+                            source_index: 0,
+                            line: 1,
+                        }),
+                    ),
+                    frame(Some(28), None),
+                ],
+                registers: None,
+            }],
+            modules: vec![],
+            sources: vec![SourceFileReport {
+                index: 0,
+                path: "/src/short.c".into(),
+                build_id: None,
+                status: SourceStatus::Embedded { bytes: 16 },
+                lines: Some(vec!["only line".into()]),
+                line_ranges: Some(vec![(1, 1)]),
+            }],
+            notes: Vec::new(),
+            source_mode: SourceMode::Context,
+            source_omitted_count: 0,
+            source_max_bytes: 1024,
+        };
+
+        let html = render_html(&report);
+        // 已嵌入的行正常链接。
+        assert!(html.contains("href=\"#src-0-L1\""));
+        // 越界行:保留原始行号,提示不可用,且不链接到任何源码行。
+        assert!(html.contains("/src/short.c:28"), "应保留原始行号");
+        assert!(html.contains("该行未嵌入"), "应提示该行不可用");
+        assert!(
+            !html.contains("href=\"#src-0-L28\"")
+                && !html.contains("href=\"#src-0-L1\">/src/short.c:28"),
+            "越界行不得链接到其他行"
+        );
     }
 
     /// P2-9:HTML 栈帧必须显示绝对指令地址;无模块归属(偏移为空)的
@@ -614,6 +733,7 @@ mod tests {
             }],
             modules: vec![],
             sources: vec![],
+            notes: Vec::new(),
             source_mode: SourceMode::None,
             source_omitted_count: 0,
             source_max_bytes: 0,

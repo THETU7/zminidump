@@ -496,11 +496,12 @@ fn wrong_build_id_elf_is_rejected() {
 /// 极简 HTTP 服务,模拟 debuginfod 的 buildid 端点。
 struct FakeDebuginfod {
     hits: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    served: Arc<Mutex<Served>>,
     url: String,
 }
 
 /// 服务端归档内容。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Served {
     /// kind(debuginfo/executable)→ build_id → 文件。
     files: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
@@ -508,6 +509,8 @@ struct Served {
     sources: std::collections::HashMap<String, std::collections::HashMap<String, PathBuf>>,
     /// 对所有 `/source` 请求返回 503(模拟服务端故障)。
     sources_always_error: bool,
+    /// 对所有 `/debuginfo` 请求返回 503。
+    debuginfo_always_error: bool,
 }
 
 /// 请求路径里的百分号编码解码(服务端视角)。
@@ -534,20 +537,23 @@ fn percent_decode(s: &str) -> String {
 }
 
 impl FakeDebuginfod {
-    fn start(served: Arc<Served>) -> Self {
+    fn start(served: Served) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let hit_counter = hits.clone();
+        let served = Arc::new(Mutex::new(served));
+        let shared = served.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let files = served.clone();
+                let files = shared.clone();
                 let hits = hit_counter.clone();
                 std::thread::spawn(move || handle(stream, files, hits));
             }
         });
         Self {
             hits,
+            served,
             url: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -555,15 +561,21 @@ impl FakeDebuginfod {
     fn count(&self, kind: &str) -> usize {
         *self.hits.lock().unwrap().get(kind).unwrap_or(&0)
     }
+
+    /// 让 `/debuginfo` 请求开始/停止返回 503(同一 URL,可复用缓存)。
+    fn set_debuginfo_error(&self, on: bool) {
+        self.served.lock().unwrap().debuginfo_always_error = on;
+    }
 }
 
 fn handle(
     mut stream: std::net::TcpStream,
-    served: Arc<Served>,
+    served: Arc<Mutex<Served>>,
     hits: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 ) {
     let mut buf = [0u8; 4096];
     let Ok(n) = stream.read(&mut buf) else { return };
+    let served = served.lock().unwrap().clone();
     let request = String::from_utf8_lossy(&buf[..n]);
     let Some(line) = request.lines().next() else {
         return;
@@ -598,6 +610,16 @@ fn handle(
     } else {
         ""
     };
+    if segments.len() == 3
+        && segments[0] == "buildid"
+        && segments[2] == "debuginfo"
+        && served.debuginfo_always_error
+    {
+        stream
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        return;
+    }
     if segments.len() >= 4
         && segments[0] == "buildid"
         && segments[2] == "source"
@@ -654,7 +676,7 @@ fn debuginfod_download_and_cache_reuse() {
         }
         served.files.insert(kind.to_string(), per_kind);
     }
-    let server = FakeDebuginfod::start(Arc::new(served));
+    let server = FakeDebuginfod::start(served);
 
     let cache = dir.join("cache");
     let opts = AnalyzeOptions {
@@ -822,7 +844,7 @@ fn user_binary_mismatch_falls_back_to_remote() {
             )]),
         );
     }
-    let server = FakeDebuginfod::start(Arc::new(served));
+    let server = FakeDebuginfod::start(served);
 
     let cache = dir.join("cache");
     let opts = AnalyzeOptions {
@@ -914,7 +936,7 @@ fn executable_only_server_still_unwinds() {
     };
 
     // 场景 A:本地无产物,服务端只有可执行镜像。
-    let server = FakeDebuginfod::start(Arc::new(served_exe_only()));
+    let server = FakeDebuginfod::start(served_exe_only());
     let cache = dir.join("cache-a");
     let opts = AnalyzeOptions {
         symbol_paths: vec![dir.join("empty")],
@@ -960,7 +982,7 @@ fn executable_only_server_still_unwinds() {
         debug_dir.join("libcrash.so.debug"),
     )
     .unwrap();
-    let server_b = FakeDebuginfod::start(Arc::new(served_exe_only()));
+    let server_b = FakeDebuginfod::start(served_exe_only());
     let cache_b = dir.join("cache-b");
     let opts_b = AnalyzeOptions {
         symbol_paths: vec![debug_dir],
@@ -1027,7 +1049,7 @@ fn source_fetch_percent_encodes_special_paths() {
         elf_build_id(&dir.join("crasher")),
         dir.join("main.c"),
     );
-    let server = FakeDebuginfod::start(Arc::new(served));
+    let server = FakeDebuginfod::start(served);
 
     // 符号走本地;源码未授权本地读取,只能经 /source 端点(P1-4)。
     let cache = dir.join("cache");
@@ -1207,7 +1229,7 @@ fn stripped_local_elf_still_fetches_remote_debuginfo() {
             dir.join("libcrash.so.debug"),
         )]),
     );
-    let server = FakeDebuginfod::start(Arc::new(served));
+    let server = FakeDebuginfod::start(served);
 
     let cache = dir.join("cache");
     let opts = AnalyzeOptions {
@@ -1303,13 +1325,13 @@ fn source_fetch_falls_back_on_server_error() {
         )]),
     );
     // 故障服务:所有 /source 请求返回 503。
-    let failing = FakeDebuginfod::start(Arc::new(Served {
+    let failing = FakeDebuginfod::start(Served {
         sources_always_error: true,
         ..Default::default()
-    }));
+    });
 
     // 1. 首个来源 503,第二个来源有文件 → 嵌入成功。
-    let backup = FakeDebuginfod::start(Arc::new(served_ok));
+    let backup = FakeDebuginfod::start(served_ok);
     let cache = dir.join("cache");
     let opts = AnalyzeOptions {
         symbol_paths: vec![dir.clone()],
@@ -1338,10 +1360,10 @@ fn source_fetch_falls_back_on_server_error() {
     assert_eq!(backup.count("source"), 1, "备用服务器应收到源码请求");
 
     // 2. 唯一的来源持续出错,本地源码根目录已授权 → 离线嵌入。
-    let failing2 = FakeDebuginfod::start(Arc::new(Served {
+    let failing2 = FakeDebuginfod::start(Served {
         sources_always_error: true,
         ..Default::default()
-    }));
+    });
     let cache2 = dir.join("cache2");
     let opts2 = AnalyzeOptions {
         symbol_paths: vec![dir.clone()],
@@ -1363,10 +1385,10 @@ fn source_fetch_falls_back_on_server_error() {
     );
 
     // 3. 唯一的来源出错且未授权本地目录 → 保留获取失败诊断。
-    let failing3 = FakeDebuginfod::start(Arc::new(Served {
+    let failing3 = FakeDebuginfod::start(Served {
         sources_always_error: true,
         ..Default::default()
-    }));
+    });
     let cache3 = dir.join("cache3");
     let opts3 = AnalyzeOptions {
         symbol_paths: vec![dir.clone()],
@@ -1385,6 +1407,151 @@ fn source_fetch_falls_back_on_server_error() {
         "所有来源失败时报告获取错误:{:?}",
         src3.status
     );
+}
+
+/// 把 dump 副本的模块列表目录项标记为未使用(其余流保持不变),
+/// 模拟缺少模块列表流的 dump。
+fn remove_module_list_stream(dump: &Path, out: &Path) {
+    let mut bytes = fs::read(dump).unwrap();
+    let rd_u32 = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let num_streams = rd_u32(&bytes, 8) as usize;
+    let dir_rva = rd_u32(&bytes, 12) as usize;
+    for i in 0..num_streams {
+        let e = dir_rva + i * 12;
+        if rd_u32(&bytes, e) == 4 {
+            bytes[e..e + 4].copy_from_slice(&0u32.to_le_bytes()); // UnusedStream
+        }
+    }
+    fs::write(out, &bytes).unwrap();
+}
+
+/// R3-P2:缺少模块列表流时用空列表继续分析;报告保留异常、线程和
+/// 已捕获的绝对地址,并说明缺少模块信息。
+#[test]
+fn missing_module_list_still_reports_exception_and_threads() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过模块列表缺失测试");
+        return;
+    }
+    let dir = fixture_dir("nomodules");
+    build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    let stripped = dir.join("crash-nomodules.dmp");
+    remove_module_list_stream(&dump, &stripped);
+
+    let report = run_analyze(
+        &stripped,
+        &base_options(vec![dir.clone()], &dir.join("cache")),
+    );
+
+    // 异常与线程保留;帧保留绝对地址。
+    let exception = report.exception.as_ref().expect("应有异常记录");
+    assert_eq!(exception.address, "0x0");
+    let thread = &report.threads[report.crashing_thread.expect("应有崩溃线程")];
+    let frame0 = thread.frames.first().expect("崩溃帧应保留");
+    assert_eq!(frame0.trust, "context");
+    let addr = frame0.instruction.trim_start_matches("0x");
+    assert!(
+        u64::from_str_radix(addr, 16).unwrap_or(0) > 0,
+        "帧应保留非零绝对地址:{}",
+        frame0.instruction
+    );
+
+    // 模块为空,报告说明缺少模块信息。
+    assert!(report.modules.is_empty());
+    assert!(
+        report.notes.iter().any(|n| n.contains("模块列表")),
+        "应在报告中说明缺少模块列表:{:?}",
+        report.notes
+    );
+
+    // 两种导出都可用。
+    let json = zminidump::render_json(&report).unwrap();
+    assert!(json.contains("模块列表"));
+    let html = zminidump::html::render_html(&report);
+    assert!(html.contains("模块信息为空"), "HTML 应展示缺失提示");
+}
+
+/// R3-P2:显式指定的调试文件缺少 DWARF 时保留为最后回退;
+/// 第一次从服务端下载 .debug 后,服务不可用(503)时同一缓存仍能提供行号。
+#[test]
+fn explicit_stripped_debug_file_uses_cached_debuginfo() {
+    if !have_tools() {
+        eprintln!("缺少 gcc/objcopy/strip,跳过显式剥离调试文件测试");
+        return;
+    }
+    let dir = fixture_dir("userdebug");
+    let (crash_line, _) = build_fixture(&dir, None);
+    let dump = dir.join("crash.dmp");
+    produce_minidump(&dir.join("crasher"), &dump);
+
+    // 服务端归档正确的独立 .debug。
+    let mut served = Served::default();
+    served.files.insert(
+        "debuginfo".to_string(),
+        std::collections::HashMap::from([(
+            elf_build_id(&dir.join("libcrash.so")),
+            dir.join("libcrash.so.debug"),
+        )]),
+    );
+    let server = FakeDebuginfod::start(served);
+
+    // --debug-file 指向剥离后的镜像(无 DWARF)。
+    let cache = dir.join("cache");
+    let opts = AnalyzeOptions {
+        user_debug_file: Some(dir.join("libcrash.so")),
+        debuginfod_urls: vec![server.url.clone()],
+        cache_dir: cache.clone(),
+        ..base_options(vec![], &cache)
+    };
+    let report = run_analyze(&dump, &opts);
+    let lib = report
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    match &lib.debuginfo {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::Debuginfod { .. }),
+            "首次运行应从服务端取得 .debug:{origin:?}"
+        ),
+        other => panic!("应从服务端获取调试文件:{other:?}"),
+    }
+    match &lib.symbols {
+        SymbolStatus::Loaded {
+            has_cfi, has_lines, ..
+        } => {
+            assert!(has_lines, "行号来自远程 .debug");
+            assert!(!has_cfi, "无可执行镜像时无 CFI 也可接受");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(server.count("debuginfo"), 1);
+
+    // 第二次:同一服务开始返回 503,同一缓存。
+    server.set_debuginfo_error(true);
+    let report2 = run_analyze(&dump, &opts);
+    let lib2 = report2
+        .modules
+        .iter()
+        .find(|m| m.name == "libcrash.so")
+        .unwrap();
+    match &lib2.debuginfo {
+        ArtifactStatus::Ok { origin, .. } => assert!(
+            matches!(origin, ArtifactOrigin::Cache { .. }),
+            "服务不可用时应使用缓存:{origin:?}"
+        ),
+        other => panic!("应命中缓存:{other:?}"),
+    }
+    match &lib2.symbols {
+        SymbolStatus::Loaded { has_lines, .. } => assert!(has_lines, "缓存 .debug 仍提供行号"),
+        other => panic!("{other:?}"),
+    }
+    let thread2 = &report2.threads[report2.crashing_thread.unwrap()];
+    assert_eq!(thread2.frames[0].line, Some(crash_line));
+    assert_eq!(server.count("debuginfo"), 1, "缓存命中后不应再次请求网络");
 }
 
 // ---------------------------------------------------------------------------

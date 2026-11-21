@@ -380,6 +380,7 @@ mod tests {
             threads: vec![],
             modules: vec![],
             sources: vec![],
+            notes: Vec::new(),
             source_mode: mode,
             source_omitted_count: 0,
             source_max_bytes: max_bytes,

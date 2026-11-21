@@ -1,0 +1,879 @@
+//! 调试产物查找:用户指定文件 → `--symbol-path` 本地扫描 → 缓存 → debuginfod。
+//!
+//! 每个候选 ELF 都必须通过完整 GNU Build ID 核验;dump 只带截短标识
+//! (Breakpad Debug ID 的 GUID 部分)时,允许按 GUID 前缀匹配并从产物
+//! 补全完整 Build ID。同一来源、同一模块、同一产物类型的并发请求合并。
+
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use debugid::{CodeId, DebugId};
+use memmap2::Mmap;
+use minidump::Module;
+use object::{Object as _, ObjectSection as _, ObjectSegment as _};
+use tokio::{sync::Mutex as AsyncMutex, sync::Semaphore};
+
+use crate::{
+    debuginfod::{self, DebuginfodClient, FetchResult},
+    report::{ArtifactOrigin, ArtifactStatus, SymbolStatus},
+};
+
+/// 产物类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtifactKind {
+    Executable,
+    DebugInfo,
+}
+
+impl ArtifactKind {
+    fn cache_leaf(self) -> &'static str {
+        match self {
+            ArtifactKind::Executable => "executable",
+            ArtifactKind::DebugInfo => "debuginfo",
+        }
+    }
+}
+
+/// 从 minidump 模块记录提取的身份标识。
+#[derive(Debug, Clone)]
+pub struct ModuleIdentity {
+    /// Breakpad Debug ID(ELF 上来自 Build ID 前 16 字节的 GUID)。
+    pub debug_id: Option<DebugId>,
+    /// Code ID;Linux ELF 上即完整 GNU Build ID(小写十六进制)。
+    pub code_id: Option<CodeId>,
+    /// code_file 的文件名。
+    pub leaf: String,
+}
+
+impl ModuleIdentity {
+    pub fn from_module(module: &dyn Module) -> Self {
+        Self {
+            debug_id: module.debug_identifier(),
+            code_id: module.code_identifier(),
+            leaf: crate::util::basename(&module.code_file()),
+        }
+    }
+
+    /// 完整 GNU Build ID(小写十六进制),优先取 Code ID。
+    pub fn full_build_id(&self) -> Option<String> {
+        self.code_id.as_ref().map(|c| c.as_str().to_string())
+    }
+
+    /// 状态表的键:同一身份的模块共享产物查找结果。
+    pub fn key(&self) -> String {
+        match (&self.debug_id, &self.code_id) {
+            (_, Some(code)) => format!("code:{}", code.as_str()),
+            (Some(debug), None) => format!("debug:{}", debug),
+            (None, None) => format!("leaf:{}", self.leaf),
+        }
+    }
+}
+
+/// 从 ELF 文件探测出的元数据。
+#[derive(Debug, Clone)]
+pub struct ElfMeta {
+    /// 完整 GNU Build ID(小写十六进制);无 note 时为 `None`。
+    pub build_id: Option<String>,
+    pub has_debug_info: bool,
+    /// 是否含有可执行段(区分真实镜像与独立调试文件)。
+    pub has_exec_segments: bool,
+}
+
+/// 探测字节缓冲区中的 ELF;非 ELF 返回 `None`。
+pub fn probe_elf_bytes(data: &[u8]) -> Option<ElfMeta> {
+    if !matches!(
+        object::read::FileKind::parse(data),
+        Ok(object::read::FileKind::Elf32 | object::read::FileKind::Elf64)
+    ) {
+        return None;
+    }
+    let obj = object::read::File::parse(data).ok()?;
+    let build_id = obj.build_id().ok().flatten().map(hex_lower);
+    let has_debug_info = obj
+        .section_by_name(".debug_info")
+        .map(|s| s.size() > 0)
+        .unwrap_or(false);
+    let has_exec_segments = obj.segments().any(|seg| {
+        matches!(
+            seg.flags(),
+            object::SegmentFlags::Elf { p_type: _, p_flags } if p_flags & object::elf::PF_X == object::elf::PF_X
+        ) && seg.data().map(|d| !d.is_empty()).unwrap_or(false)
+    });
+    Some(ElfMeta {
+        build_id,
+        has_debug_info,
+        has_exec_segments,
+    })
+}
+
+/// 探测磁盘上的 ELF 文件。
+pub fn probe_elf_file(path: &Path) -> Option<ElfMeta> {
+    let file = fs::File::open(path).ok()?;
+    let map = unsafe { Mmap::map(&file) }.ok()?;
+    probe_elf_bytes(&map)
+}
+
+pub fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// ELF 与模块身份的匹配结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdMatch {
+    /// 完整 Build ID 一致。
+    Full,
+    /// 仅 GUID(Breakpad Debug ID)一致,dump 带的是截短标识。
+    TruncatedGuid,
+}
+
+/// 校验 ELF 元数据是否匹配模块身份。
+pub fn match_identity(meta: &ElfMeta, ident: &ModuleIdentity) -> Option<IdMatch> {
+    let Some(elf_id) = &meta.build_id else {
+        return None;
+    };
+    if let Some(code) = ident.code_id.as_ref()
+        && elf_id.eq_ignore_ascii_case(code.as_str())
+    {
+        return Some(IdMatch::Full);
+    }
+    if let Some(debug) = ident.debug_id
+        && guid_matches(elf_id, &debug)
+    {
+        return Some(IdMatch::TruncatedGuid);
+    }
+    None
+}
+
+/// 判断 Build ID 十六进制串的前 16 字节是否对应给定的 Breakpad Debug ID。
+pub fn guid_matches(build_id_hex: &str, debug: &DebugId) -> bool {
+    let bytes = match hex_to_bytes(build_id_hex) {
+        Some(b) => b,
+        None => return false,
+    };
+    if bytes.len() < 16 {
+        return false;
+    }
+    match debugid::DebugId::from_guid_age(&bytes[..16], 0) {
+        Ok(d) => d == *debug,
+        Err(_) => false,
+    }
+}
+
+pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.trim();
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// 本地扫描索引条目:ELF 产物。
+#[derive(Debug, Clone)]
+pub struct LocalElf {
+    pub path: PathBuf,
+    pub meta: ElfMeta,
+}
+
+/// 本地扫描索引条目:预生成的 Breakpad `.sym`。
+#[derive(Debug, Clone)]
+pub struct LocalSym {
+    pub path: PathBuf,
+    /// .sym MODULE 行中的 Debug ID。
+    pub debug_id: String,
+    pub name: String,
+}
+
+/// `--symbol-path` 目录的扫描索引。
+#[derive(Debug, Default)]
+pub struct LocalIndex {
+    elfs: Vec<LocalElf>,
+    syms: Vec<LocalSym>,
+}
+
+const MAX_SCAN_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 单文件 2 GiB 上限
+
+impl LocalIndex {
+    /// 扫描目录,建立 ELF 与 .sym 索引。忽略无法解析的文件。
+    pub fn scan(dirs: &[PathBuf]) -> Self {
+        let mut index = Self::default();
+        for dir in dirs {
+            index.walk(dir);
+        }
+        index
+    }
+
+    fn walk(&mut self, dir: &Path) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                self.walk(&entry.path());
+                continue;
+            }
+            if !ft.is_file() && !ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() > MAX_SCAN_FILE_BYTES || meta.len() == 0 {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("sym") {
+                if let Some(sym) = probe_sym_file(&path) {
+                    self.syms.push(sym);
+                }
+            } else if let Some(elf) = probe_elf_file(&path) {
+                self.elfs.push(LocalElf { path, meta: elf });
+            }
+        }
+    }
+
+    /// 按身份查找 ELF 产物;按产物类型选择最佳候选。
+    pub fn find_elf(&self, ident: &ModuleIdentity, kind: ArtifactKind) -> Option<&LocalElf> {
+        let mut best: Option<(u32, &LocalElf)> = None;
+        for elf in &self.elfs {
+            let Some(m) = match_identity(&elf.meta, ident) else {
+                continue;
+            };
+            // 评分:完整匹配优先;按类型偏好调试信息/可执行段。
+            let mut score = match m {
+                IdMatch::Full => 2,
+                IdMatch::TruncatedGuid => 1,
+            };
+            score *= 10;
+            match kind {
+                ArtifactKind::DebugInfo => {
+                    if elf.meta.has_debug_info {
+                        score += 2;
+                    }
+                }
+                ArtifactKind::Executable => {
+                    if elf.meta.has_exec_segments {
+                        score += 2;
+                    }
+                    if !looks_like_debug_file(&elf.path) {
+                        score += 1;
+                    }
+                }
+            }
+            if best.map(|(s, _)| score > s).unwrap_or(true) {
+                best = Some((score, elf));
+            }
+        }
+        best.map(|(_, e)| e)
+    }
+
+    /// 查找文件名相同但 Build ID 不符的 ELF(身份不匹配诊断)。
+    pub fn find_conflicting(&self, ident: &ModuleIdentity) -> Option<&LocalElf> {
+        self.elfs.iter().find(|e| {
+            crate::util::basename(&e.path.to_string_lossy()) == ident.leaf
+                && match_identity(&e.meta, ident).is_none()
+        })
+    }
+
+    /// 按 Breakpad Debug ID 查找预生成 `.sym`。
+    pub fn find_sym(&self, ident: &ModuleIdentity) -> Option<&LocalSym> {
+        let debug = ident.debug_id?;
+        // .sym 的 MODULE 行使用 Breakpad 格式(大写 GUID-AGE)。
+        let wanted = format!("{debug}");
+        let wanted_upper = wanted.to_uppercase();
+        self.syms.iter().find(|s| {
+            s.debug_id.eq_ignore_ascii_case(&wanted)
+                || s.debug_id.eq_ignore_ascii_case(&wanted_upper)
+        })
+    }
+}
+
+fn looks_like_debug_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "debug")
+        .unwrap_or(false)
+        || path.to_string_lossy().ends_with(".dwo")
+}
+
+/// 解析 `.sym` 文件首行 `MODULE <os> <arch> <id> <name>`。
+fn probe_sym_file(path: &Path) -> Option<LocalSym> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "MODULE" {
+        return None;
+    }
+    let _os = parts.next()?;
+    let _arch = parts.next()?;
+    let debug_id = parts.next()?.to_string();
+    let name = parts.next().unwrap_or("").to_string();
+    Some(LocalSym {
+        path: path.to_path_buf(),
+        debug_id,
+        name,
+    })
+}
+
+/// 网络与缓存限制。
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub timeout: Duration,
+    /// 单次下载大小上限。
+    pub max_download_bytes: u64,
+    /// 最大并发下载数。
+    pub max_concurrent: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60),
+            max_download_bytes: 512 * 1024 * 1024,
+            max_concurrent: 4,
+        }
+    }
+}
+
+/// 查找配置。
+#[derive(Debug, Clone, Default)]
+pub struct ResolverConfig {
+    pub symbol_paths: Vec<PathBuf>,
+    /// 用户显式指定的主程序(`--binary`),按文件名辅助匹配。
+    pub user_binary: Option<PathBuf>,
+    /// 用户显式指定的独立调试文件(`--debug-file`)。
+    pub user_debug_file: Option<PathBuf>,
+    pub debuginfod_urls: Vec<String>,
+    pub cache_dir: PathBuf,
+    pub limits: Limits,
+}
+
+/// 单个模块的产物与符号状态汇总。
+#[derive(Debug, Clone, Default)]
+pub struct ModuleArtifacts {
+    pub executable: Option<ArtifactStatus>,
+    pub debuginfo: Option<ArtifactStatus>,
+    pub symbols: Option<SymbolStatus>,
+    /// 匹配产物核验出的完整 Build ID(dump 截短时补全)。
+    pub resolved_build_id: Option<String>,
+}
+
+/// 成功解析到的产物。
+#[derive(Debug, Clone)]
+pub struct ResolvedArtifact {
+    pub path: PathBuf,
+    pub origin: ArtifactOrigin,
+    pub build_id: String,
+    pub has_debug_info: bool,
+}
+
+/// (模块键, 产物类型) → 闩锁表。
+type LatchMap = HashMap<(String, ArtifactKind), Arc<AsyncMutex<()>>>;
+
+/// 产物解析器:串起用户文件、本地索引、缓存与 debuginfod。
+pub struct ArtifactResolver {
+    cfg: ResolverConfig,
+    local: LocalIndex,
+    client: DebuginfodClient,
+    states: Mutex<HashMap<String, ModuleArtifacts>>,
+    /// (模块键, 产物类型) → 闩锁,合并并发请求。
+    latches: Mutex<LatchMap>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl ArtifactResolver {
+    pub fn new(cfg: ResolverConfig) -> Self {
+        let local = LocalIndex::scan(&cfg.symbol_paths);
+        let client = DebuginfodClient::new(cfg.limits.timeout, cfg.limits.max_download_bytes);
+        let semaphore = Arc::new(Semaphore::new(cfg.limits.max_concurrent.max(1)));
+        Self {
+            cfg,
+            local,
+            client,
+            states: Mutex::new(HashMap::new()),
+            latches: Mutex::new(HashMap::new()),
+            semaphore,
+        }
+    }
+
+    /// 解析指定产物。并发调用按 (模块, 类型) 合并;结果写入状态表。
+    pub async fn resolve(
+        &self,
+        kind: ArtifactKind,
+        ident: &ModuleIdentity,
+    ) -> Result<ResolvedArtifact, ArtifactStatus> {
+        let key = ident.key();
+
+        // 同键请求合并:拿闩锁后复查状态表。
+        let latch = {
+            let mut map = self.latches.lock().unwrap();
+            map.entry((key.clone(), kind))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _guard = latch.lock().await;
+
+        let result = self.resolve_uncached(kind, ident).await;
+        match &result {
+            Ok(artifact) => {
+                let mut states = self.states.lock().unwrap();
+                let entry = states.entry(key).or_default();
+                entry.set_status(
+                    kind,
+                    ArtifactStatus::Ok {
+                        origin: artifact.origin.clone(),
+                        build_id: artifact.build_id.clone(),
+                        has_debug_info: artifact.has_debug_info,
+                    },
+                );
+                if entry.resolved_build_id.is_none() {
+                    entry.resolved_build_id = Some(artifact.build_id.clone());
+                }
+            }
+            Err(status) => {
+                // 保留更具体的失败原因;避免用 NoSource 覆盖 IdentityMismatch 等。
+                let mut states = self.states.lock().unwrap();
+                let entry = states.entry(key).or_default();
+                let replace = match entry.status(kind) {
+                    None => true,
+                    Some(ArtifactStatus::NoSource) => true,
+                    Some(_) => false,
+                };
+                if replace {
+                    entry.set_status(kind, status.clone());
+                }
+            }
+        }
+        result
+    }
+
+    /// 只做本地与缓存检查,不发起网络请求;用于报告收尾。
+    pub fn probe_local(
+        &self,
+        kind: ArtifactKind,
+        ident: &ModuleIdentity,
+    ) -> Result<ResolvedArtifact, ArtifactStatus> {
+        self.local_and_cache(kind, ident)
+    }
+
+    async fn resolve_uncached(
+        &self,
+        kind: ArtifactKind,
+        ident: &ModuleIdentity,
+    ) -> Result<ResolvedArtifact, ArtifactStatus> {
+        // 本地(用户指定 + 扫描)与缓存。
+        match self.local_and_cache(kind, ident) {
+            Ok(a) => return Ok(a),
+            Err(status) => {
+                // IdentityMismatch 具有诊断价值,直接返回;
+                // 其余情况继续尝试网络。
+                if matches!(status, ArtifactStatus::IdentityMismatch { .. }) {
+                    return Err(status);
+                }
+            }
+        }
+
+        self.fetch_remote(kind, ident).await
+    }
+
+    fn local_and_cache(
+        &self,
+        kind: ArtifactKind,
+        ident: &ModuleIdentity,
+    ) -> Result<ResolvedArtifact, ArtifactStatus> {
+        let mut mismatch: Option<ArtifactStatus> = None;
+
+        // 1. 用户显式指定的文件。
+        let user_path = match kind {
+            ArtifactKind::Executable => self.cfg.user_binary.clone(),
+            ArtifactKind::DebugInfo => self.cfg.user_debug_file.clone(),
+        };
+        if let Some(path) = user_path {
+            let path_display = path.display().to_string();
+            match probe_elf_file(&path) {
+                Some(meta) => {
+                    if match_identity(&meta, ident).is_some() {
+                        return Ok(ResolvedArtifact {
+                            path,
+                            origin: ArtifactOrigin::UserSpecified { path: path_display },
+                            build_id: meta.build_id.unwrap_or_default(),
+                            has_debug_info: meta.has_debug_info,
+                        });
+                    }
+                    // dump 无身份时,允许按文件名辅助匹配用户指定的主程序。
+                    if ident.debug_id.is_none()
+                        && ident.code_id.is_none()
+                        && crate::util::basename(&path.to_string_lossy()) == ident.leaf
+                        && let Some(build_id) = meta.build_id.clone()
+                    {
+                        return Ok(ResolvedArtifact {
+                            path,
+                            origin: ArtifactOrigin::UserSpecified { path: path_display },
+                            build_id,
+                            has_debug_info: meta.has_debug_info,
+                        });
+                    }
+                    mismatch = Some(ArtifactStatus::IdentityMismatch {
+                        path: path_display,
+                        expected: ident.full_build_id().unwrap_or_else(|| "无".into()),
+                        found: meta.build_id.unwrap_or_else(|| "无".into()),
+                    });
+                }
+                None => {
+                    mismatch = Some(ArtifactStatus::FetchFailed {
+                        server: "用户指定文件".into(),
+                        message: format!("无法解析 {path_display} (不是 ELF 或不可读)"),
+                    });
+                }
+            }
+        }
+
+        // 2. 本地扫描索引。
+        if let Some(elf) = self.local.find_elf(ident, kind) {
+            return Ok(ResolvedArtifact {
+                path: elf.path.clone(),
+                origin: ArtifactOrigin::SymbolPath {
+                    path: elf.path.display().to_string(),
+                },
+                build_id: elf.meta.build_id.clone().unwrap_or_default(),
+                has_debug_info: elf.meta.has_debug_info,
+            });
+        }
+
+        // 3. 缓存(此前从 debuginfod 下载)。
+        if let Some(build_id) = ident.full_build_id() {
+            for server in &self.cfg.debuginfod_urls {
+                let path = self.cache_path(server, &build_id, kind);
+                let path_display = path.display().to_string();
+                if path.is_file()
+                    && let Some(meta) = probe_elf_file(&path)
+                    && match_identity(&meta, ident).is_some()
+                {
+                    return Ok(ResolvedArtifact {
+                        path,
+                        origin: ArtifactOrigin::Cache { path: path_display },
+                        build_id: meta.build_id.unwrap_or_default(),
+                        has_debug_info: meta.has_debug_info,
+                    });
+                }
+            }
+        }
+
+        // 3.5 扫描目录中有同名文件但 Build ID 不符 → 报告身份不匹配。
+        if mismatch.is_none()
+            && let Some(conflict) = self.local.find_conflicting(ident)
+        {
+            mismatch = Some(ArtifactStatus::IdentityMismatch {
+                path: conflict.path.display().to_string(),
+                expected: ident.full_build_id().unwrap_or_else(|| "无".into()),
+                found: conflict
+                    .meta
+                    .build_id
+                    .clone()
+                    .unwrap_or_else(|| "无".into()),
+            });
+        }
+        if let Some(m) = mismatch {
+            return Err(m);
+        }
+        if ident.debug_id.is_none() && ident.code_id.is_none() {
+            return Err(ArtifactStatus::MissingIdentity);
+        }
+        if self.cfg.debuginfod_urls.is_empty() {
+            return Err(ArtifactStatus::NoSource);
+        }
+        Err(ArtifactStatus::NoSource)
+    }
+
+    async fn fetch_remote(
+        &self,
+        kind: ArtifactKind,
+        ident: &ModuleIdentity,
+    ) -> Result<ResolvedArtifact, ArtifactStatus> {
+        let Some(build_id) = ident.full_build_id() else {
+            return Err(ArtifactStatus::MissingIdentity);
+        };
+        if self.cfg.debuginfod_urls.is_empty() {
+            return Err(ArtifactStatus::NoSource);
+        }
+
+        let mut last_not_archived = None;
+        let mut last_error = None;
+        for server in self.cfg.debuginfod_urls.clone() {
+            let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+            let client = self.client.clone();
+            let bid = build_id.clone();
+            let k = kind;
+            let fetch_server = server.clone();
+            let result = tokio::task::spawn_blocking(move || match k {
+                ArtifactKind::Executable => client.fetch_executable(&fetch_server, &bid),
+                ArtifactKind::DebugInfo => client.fetch_debuginfo(&fetch_server, &bid),
+            })
+            .await;
+            drop(permit);
+
+            let bytes = match result {
+                Ok(FetchResult::Ok(bytes)) => bytes,
+                Ok(FetchResult::NotFound) => {
+                    last_not_archived = Some(server.clone());
+                    continue;
+                }
+                Ok(FetchResult::Failed(message)) => {
+                    last_error = Some(ArtifactStatus::FetchFailed {
+                        server: server.clone(),
+                        message,
+                    });
+                    continue;
+                }
+                Err(join) => {
+                    last_error = Some(ArtifactStatus::FetchFailed {
+                        server: server.clone(),
+                        message: format!("下载任务失败:{join}"),
+                    });
+                    continue;
+                }
+            };
+
+            // 核验下载产物的完整 Build ID,防止网关返回错误内容。
+            let Some(meta) = probe_elf_bytes(&bytes) else {
+                last_error = Some(ArtifactStatus::FetchFailed {
+                    server: server.clone(),
+                    message: "下载内容不是 ELF".into(),
+                });
+                continue;
+            };
+            if meta.build_id.as_deref() != Some(build_id.as_str()) {
+                last_error = Some(ArtifactStatus::IdentityMismatch {
+                    path: format!("{server} (下载)"),
+                    expected: build_id.clone(),
+                    found: meta.build_id.unwrap_or_else(|| "无".into()),
+                });
+                continue;
+            }
+
+            // 写入缓存后返回。
+            let cache_path = self.cache_path(&server, &build_id, kind);
+            if write_atomic(&cache_path, &bytes).is_err() {
+                last_error = Some(ArtifactStatus::FetchFailed {
+                    server: server.clone(),
+                    message: format!("写入缓存失败:{}", cache_path.display()),
+                });
+                continue;
+            }
+            return Ok(ResolvedArtifact {
+                path: cache_path.clone(),
+                origin: ArtifactOrigin::Debuginfod {
+                    server: server.clone(),
+                    path: cache_path.display().to_string(),
+                },
+                build_id,
+                has_debug_info: meta.has_debug_info,
+            });
+        }
+
+        if let Some(e) = last_error {
+            return Err(e);
+        }
+        if let Some(server) = last_not_archived {
+            return Err(ArtifactStatus::NotArchived { server });
+        }
+        Err(ArtifactStatus::NoSource)
+    }
+
+    fn cache_path(&self, server: &str, build_id: &str, kind: ArtifactKind) -> PathBuf {
+        self.cfg
+            .cache_dir
+            .join("debuginfod")
+            .join(debuginfod::server_dir_name(server))
+            .join(build_id)
+            .join(kind.cache_leaf())
+    }
+
+    /// 源码缓存路径。
+    pub fn source_cache_path(&self, server: &str, build_id: &str, source_path: &str) -> PathBuf {
+        self.cfg
+            .cache_dir
+            .join("source")
+            .join(debuginfod::server_dir_name(server))
+            .join(build_id)
+            .join(format!("{}.txt", crate::util::path_hash(source_path)))
+    }
+
+    pub fn config(&self) -> &ResolverConfig {
+        &self.cfg
+    }
+
+    /// 暴露 `.sym` 索引(symbols 模块使用)。
+    pub fn local_sym_index(&self) -> &LocalIndex {
+        &self.local
+    }
+
+    pub fn client(&self) -> &DebuginfodClient {
+        &self.client
+    }
+
+    pub fn semaphore(&self) -> &Arc<Semaphore> {
+        &self.semaphore
+    }
+
+    /// 记录/读取符号状态。
+    pub fn record_symbols(&self, key: &str, status: SymbolStatus) {
+        self.states
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .symbols = Some(status);
+    }
+
+    /// 读取模块状态;不存在时用 `probe_local` 填充(不联网)。
+    pub fn finalize_module(&self, ident: &ModuleIdentity) -> ModuleArtifacts {
+        let key = ident.key();
+        let mut entry = {
+            let states = self.states.lock().unwrap();
+            states.get(&key).cloned().unwrap_or_default()
+        };
+        if entry.executable.is_none() {
+            entry.executable = Some(match self.probe_local(ArtifactKind::Executable, ident) {
+                Ok(a) => ArtifactStatus::Ok {
+                    origin: a.origin,
+                    build_id: a.build_id,
+                    has_debug_info: a.has_debug_info,
+                },
+                Err(e) => e,
+            });
+            if entry.resolved_build_id.is_none()
+                && let Some(a) = entry.executable.as_ref()
+                && let ArtifactStatus::Ok { build_id, .. } = a
+            {
+                entry.resolved_build_id = Some(build_id.clone());
+            }
+        }
+        if entry.debuginfo.is_none() {
+            entry.debuginfo = Some(match self.probe_local(ArtifactKind::DebugInfo, ident) {
+                Ok(a) => ArtifactStatus::Ok {
+                    origin: a.origin,
+                    build_id: a.build_id,
+                    has_debug_info: a.has_debug_info,
+                },
+                Err(e) => e,
+            });
+        }
+        entry
+    }
+}
+
+impl ModuleArtifacts {
+    fn status(&self, kind: ArtifactKind) -> Option<&ArtifactStatus> {
+        match kind {
+            ArtifactKind::Executable => self.executable.as_ref(),
+            ArtifactKind::DebugInfo => self.debuginfo.as_ref(),
+        }
+    }
+
+    fn set_status(&mut self, kind: ArtifactKind, status: ArtifactStatus) {
+        match kind {
+            ArtifactKind::Executable => self.executable = Some(status),
+            ArtifactKind::DebugInfo => self.debuginfo = Some(status),
+        }
+    }
+}
+
+/// 原子写:先写临时文件再 rename。
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(build_id: Option<&str>, guid: Option<&str>) -> ModuleIdentity {
+        ModuleIdentity {
+            debug_id: guid.map(|g| g.parse().unwrap()),
+            code_id: build_id.map(|b| CodeId::new(b.to_string())),
+            leaf: "libtest.so".into(),
+        }
+    }
+
+    #[test]
+    fn guid_matches_uses_first_16_bytes() {
+        // build id = 20 字节;GUID 只取前 16 字节。
+        let build_id = "00112233445566778899aabbccddeeff0011";
+        let bytes = hex_to_bytes(build_id).unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes[..16], 0).unwrap();
+        assert!(guid_matches(build_id, &debug));
+        // 最后 4 字节不同的 build id 仍匹配同一 GUID。
+        assert!(guid_matches("00112233445566778899aabbccddeeffffff", &debug));
+        // 前 16 字节不同则不匹配。
+        assert!(!guid_matches(
+            "ff112233445566778899aabbccddeeff0011",
+            &debug
+        ));
+    }
+
+    #[test]
+    fn match_identity_full_vs_truncated() {
+        let meta = ElfMeta {
+            build_id: Some("aabbccddeeff00112233445566778899aabb".into()),
+            has_debug_info: true,
+            has_exec_segments: true,
+        };
+        let full = ident(Some("aabbccddeeff00112233445566778899aabb"), None);
+        assert_eq!(match_identity(&meta, &full), Some(IdMatch::Full));
+
+        let bytes = hex_to_bytes("aabbccddeeff00112233445566778899aabb").unwrap();
+        let debug = debugid::DebugId::from_guid_age(&bytes[..16], 0).unwrap();
+        let truncated = ModuleIdentity {
+            debug_id: Some(debug),
+            code_id: None,
+            leaf: "x".into(),
+        };
+        assert_eq!(
+            match_identity(&meta, &truncated),
+            Some(IdMatch::TruncatedGuid)
+        );
+
+        let wrong = ident(Some("111111111111111111111111111111111111"), None);
+        assert_eq!(match_identity(&meta, &wrong), None);
+    }
+
+    #[test]
+    fn sym_file_probe() {
+        let dir = std::env::temp_dir().join(format!("zmtest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let sym = dir.join("test.sym");
+        fs::write(
+            &sym,
+            "MODULE Linux x86_64 4F2A1B0C3D4E5F60718293A4B5C6D7E80 libtest.so\n",
+        )
+        .unwrap();
+        let probed = probe_sym_file(&sym).unwrap();
+        assert_eq!(probed.name, "libtest.so");
+        assert_eq!(probed.debug_id.len(), 33); // 32 hex + age
+        fs::remove_dir_all(&dir).ok();
+    }
+}

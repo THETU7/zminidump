@@ -1,0 +1,53 @@
+# 三类宿主预编译 CLI 包(设计:外网访问和分发)。
+# 推送 v* 标签时构建 Windows / macOS / Linux 的发布压缩包。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: zminidump-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: zminidump-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: zminidump-windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/${{ matrix.target }}/release/zminidump.exe dist/
+          else
+            cp target/${{ matrix.target }}/release/zminidump dist/
+            cp README.md dist/
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
